@@ -49,7 +49,7 @@ def _cache_set(key: str, value: Any) -> None:
 
 def _tmdb_get(path: str, params: dict | None = None) -> dict:
     api_key = current_app.config["TMDB_API_KEY"]
-    base_url = current_app.config["TMDB_BASE_URL"].rstrip("/")
+    base_url = current_app.config["TMDB_BASE_URL"]
     merged_params = {"api_key": api_key, **(params or {})}
     response = requests.get(
         f"{base_url}{path}", params=merged_params, timeout=10
