@@ -35,6 +35,11 @@ def create_review():
         "release_date": body.get("release_date"),
     }
 
+    # Optional: category_id and group_ids for Phase 2 features
+    category_id = body.get("category_id") or None
+    raw_group_ids = body.get("group_ids") or []
+    group_ids = [str(g) for g in raw_group_ids if g] if isinstance(raw_group_ids, list) else []
+
     supabase = get_supabase()
 
     try:
@@ -45,9 +50,17 @@ def create_review():
             "movie_id": movie_id,
             "rating": float(rating),
             "review_text": review_text,
+            "category_id": category_id,
         }
         result = supabase.table("reviews").insert(review_payload).execute()
-        return jsonify(result.data[0]), 201
+        review = result.data[0]
+
+        # Record group recommendations if provided
+        if group_ids and review.get("id"):
+            rec_rows = [{"review_id": review["id"], "group_id": gid} for gid in group_ids]
+            supabase.table("group_recommendations").insert(rec_rows).execute()
+
+        return jsonify(review), 201
     except Exception as exc:
         return jsonify({"error": "Failed to save review", "detail": str(exc)}), 500
 
