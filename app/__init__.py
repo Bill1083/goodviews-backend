@@ -25,6 +25,7 @@ def create_app() -> Flask:
     from app.controllers.friends import friends_bp
     from app.controllers.friend_groups import friend_groups_bp
     from app.controllers.profile import profile_bp
+    from app.controllers.watchlist import watchlist_bp
 
     app.register_blueprint(movies_bp, url_prefix="/api/movies")
     app.register_blueprint(reviews_bp, url_prefix="/api/reviews")
@@ -32,6 +33,7 @@ def create_app() -> Flask:
     app.register_blueprint(friends_bp, url_prefix="/api/friends")
     app.register_blueprint(friend_groups_bp, url_prefix="/api/groups")
     app.register_blueprint(profile_bp, url_prefix="/api/profile")
+    app.register_blueprint(watchlist_bp, url_prefix="/api/watchlist")
 
     @app.get("/api/health")
     def health():
