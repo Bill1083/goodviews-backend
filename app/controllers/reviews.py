@@ -165,9 +165,13 @@ def movie_reviews(movie_id: int):
                 .execute()
             )
             friend_reviews = fr_result.data
-            if friend_reviews:
-                ratings = [r["rating"] for r in friend_reviews]
-                avg_rating = round(sum(ratings) / len(ratings), 1)
+
+        # Include the user's own rating in the average (if they have a review)
+        all_ratings = [r["rating"] for r in friend_reviews]
+        if my_review:
+            all_ratings.append(my_review["rating"])
+        if all_ratings:
+            avg_rating = round(sum(all_ratings) / len(all_ratings), 1)
 
         return jsonify({
             "my_review": my_review,
