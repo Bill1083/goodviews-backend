@@ -81,6 +81,67 @@ def list_friends():
         return jsonify({"error": "Failed to fetch friends", "detail": str(exc)}), 500
 
 
+@friends_bp.get("/recent-activity")
+@require_auth
+@limiter.limit("60 per minute")
+def friends_recent_activity():
+    """Return friends' reviews from the last 7 days, grouped by friend.
+    Friends who have hide_recent_movies=true are excluded.
+    """
+    user = request.current_user
+    supabase = get_supabase()
+    from datetime import datetime, timedelta, timezone
+    since = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+
+    try:
+        # Get friend IDs (exclude those who have hidden their recent activity)
+        friends_result = (
+            supabase.table("friendships")
+            .select("friend_id, profiles!friendships_friend_id_fkey(id, username, hide_recent_movies)")
+            .eq("user_id", str(user.id))
+            .execute()
+        )
+        visible_friends = [
+            {"id": r["profiles"]["id"], "username": r["profiles"]["username"]}
+            for r in friends_result.data
+            if r.get("profiles") and not r["profiles"].get("hide_recent_movies", False)
+        ]
+
+        if not visible_friends:
+            return jsonify([])
+
+        friend_ids = [f["id"] for f in visible_friends]
+        friend_map = {f["id"]: f["username"] for f in visible_friends}
+
+        # Get reviews in the last 7 days for these friends
+        reviews_result = (
+            supabase.table("reviews")
+            .select("id, user_id, movie_id, rating, review_text, rewatch_count, created_at, movies(id, title, poster_path, release_date)")
+            .in_("user_id", friend_ids)
+            .gte("created_at", since)
+            .order("created_at", desc=True)
+            .execute()
+        )
+
+        # Group by friend
+        by_friend: dict = {}
+        for r in reviews_result.data:
+            uid = r["user_id"]
+            if uid not in by_friend:
+                by_friend[uid] = {
+                    "friend_id": uid,
+                    "username": friend_map.get(uid, "Unknown"),
+                    "reviews": [],
+                }
+            by_friend[uid]["reviews"].append(r)
+
+        # Return only friends who have at least one review
+        result = [v for v in by_friend.values() if v["reviews"]]
+        return jsonify(result)
+    except Exception as exc:
+        return jsonify({"error": "Failed to fetch friend activity", "detail": str(exc)}), 500
+
+
 @friends_bp.post("/")
 @require_auth
 @limiter.limit("20 per hour")
