@@ -4,8 +4,41 @@ from app import limiter
 from app.utils.auth import require_auth
 from app.utils.sanitize import sanitize_text
 from app.services.supabase_client import get_supabase
+from app.services import tmdb as tmdb_service
 
 watchlist_bp = Blueprint("watchlist", __name__)
+
+
+def _enrich_movies(movies: list[dict], supabase) -> list[dict]:
+    """Backfill genre_ids and vote_average for movies missing those fields, using cached TMDB data."""
+    enriched = []
+    db_updates = []
+    for movie in movies:
+        if movie is None:
+            enriched.append(movie)
+            continue
+        needs_genre = movie.get("genre_ids") is None
+        needs_vote = movie.get("vote_average") is None
+        if needs_genre or needs_vote:
+            try:
+                details = tmdb_service.get_movie_details(movie["id"])
+                update: dict = {}
+                if needs_genre and details.get("genres"):
+                    update["genre_ids"] = [g["id"] for g in details["genres"]]
+                if needs_vote and details.get("vote_average") is not None:
+                    update["vote_average"] = details["vote_average"]
+                if update:
+                    db_updates.append({"id": movie["id"], **update})
+                    movie = {**movie, **update}
+            except Exception:
+                pass
+        enriched.append(movie)
+    if db_updates:
+        try:
+            supabase.table("movies").upsert(db_updates, on_conflict="id").execute()
+        except Exception:
+            pass
+    return enriched
 
 
 @watchlist_bp.get("/")
@@ -17,12 +50,24 @@ def get_watchlist():
     try:
         result = (
             supabase.table("watchlist")
-            .select("movie_id, added_at, movies(id, title, poster_path, release_date)")
+            .select("movie_id, added_at, movies(id, title, poster_path, release_date, vote_average, genre_ids)")
             .eq("user_id", str(user.id))
             .order("added_at", desc=True)
             .execute()
         )
-        return jsonify(result.data)
+        items = result.data
+        # Enrich movies missing genre_ids or vote_average from TMDB (cached)
+        movie_map: dict[int, dict] = {}
+        for item in items:
+            m = item.get("movies")
+            if m and m["id"] not in movie_map:
+                movie_map[m["id"]] = m
+        enriched_movies = _enrich_movies(list(movie_map.values()), supabase)
+        enriched_map = {m["id"]: m for m in enriched_movies if m}
+        for item in items:
+            if item.get("movies") and item["movies"]["id"] in enriched_map:
+                item["movies"] = enriched_map[item["movies"]["id"]]
+        return jsonify(items)
     except Exception as exc:
         return jsonify({"error": "Failed to fetch watchlist", "detail": str(exc)}), 500
 
@@ -43,6 +88,16 @@ def add_to_watchlist():
         "poster_path": body.get("poster_path"),
         "release_date": body.get("release_date"),
     }
+    raw_genre_ids = body.get("genre_ids") or []
+    genre_ids_list = [int(g) for g in raw_genre_ids if isinstance(g, (int, float))] if isinstance(raw_genre_ids, list) else []
+    if genre_ids_list:
+        movie_data["genre_ids"] = genre_ids_list
+    vote_average = body.get("vote_average")
+    if vote_average is not None:
+        try:
+            movie_data["vote_average"] = float(vote_average)
+        except (ValueError, TypeError):
+            pass
 
     supabase = get_supabase()
     try:

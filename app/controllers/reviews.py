@@ -4,8 +4,41 @@ from app import limiter
 from app.utils.auth import require_auth
 from app.utils.sanitize import sanitize_text
 from app.services.supabase_client import get_supabase
+from app.services import tmdb as tmdb_service
 
 reviews_bp = Blueprint("reviews", __name__)
+
+
+def _enrich_movies(movies: list[dict], supabase) -> list[dict]:
+    """Backfill genre_ids and vote_average for movies missing those fields, using cached TMDB data."""
+    enriched = []
+    db_updates = []
+    for movie in movies:
+        if movie is None:
+            enriched.append(movie)
+            continue
+        needs_genre = movie.get("genre_ids") is None
+        needs_vote = movie.get("vote_average") is None
+        if needs_genre or needs_vote:
+            try:
+                details = tmdb_service.get_movie_details(movie["id"])
+                update: dict = {}
+                if needs_genre and details.get("genres"):
+                    update["genre_ids"] = [g["id"] for g in details["genres"]]
+                if needs_vote and details.get("vote_average") is not None:
+                    update["vote_average"] = details["vote_average"]
+                if update:
+                    db_updates.append({"id": movie["id"], **update})
+                    movie = {**movie, **update}
+            except Exception:
+                pass
+        enriched.append(movie)
+    if db_updates:
+        try:
+            supabase.table("movies").upsert(db_updates, on_conflict="id").execute()
+        except Exception:
+            pass
+    return enriched
 
 
 @reviews_bp.post("/")
@@ -34,6 +67,10 @@ def create_review():
         "poster_path": body.get("poster_path"),
         "release_date": body.get("release_date"),
     }
+    raw_genre_ids = body.get("genre_ids") or []
+    genre_ids_list = [int(g) for g in raw_genre_ids if isinstance(g, (int, float))] if isinstance(raw_genre_ids, list) else []
+    if genre_ids_list:
+        movie_data["genre_ids"] = genre_ids_list
     vote_average = body.get("vote_average")
     if vote_average is not None:
         try:
@@ -69,10 +106,32 @@ def create_review():
         # Auto-remove from watchlist when a review is written
         supabase.table("watchlist").delete().eq("user_id", str(user.id)).eq("movie_id", movie_id).execute()
 
-        # Record group recommendations if provided
-        if group_ids and review.get("id"):
-            rec_rows = [{"review_id": review["id"], "group_id": gid} for gid in group_ids]
-            supabase.table("group_recommendations").insert(rec_rows).execute()
+        # Expand group_ids to individual member notifications (same as recommend_movie)
+        all_group_recipient_ids: set[str] = set()
+        if group_ids:
+            for gid in group_ids:
+                members = supabase.table("group_members").select("user_id").eq("group_id", gid).execute()
+                for m in members.data:
+                    all_group_recipient_ids.add(m["user_id"])
+            all_group_recipient_ids.discard(str(user.id))
+            if all_group_recipient_ids:
+                group_notif_rows = [
+                    {
+                        "user_id": rid,
+                        "sender_id": str(user.id),
+                        "movie_id": movie_id,
+                        "message": "recommended a movie to you",
+                    }
+                    for rid in all_group_recipient_ids
+                ]
+                supabase.table("notifications").insert(group_notif_rows).execute()
+            # Record in group_recommendations for feed tracking (non-fatal if it fails)
+            try:
+                if review.get("id"):
+                    rec_rows = [{"review_id": review["id"], "group_id": gid} for gid in group_ids]
+                    supabase.table("group_recommendations").upsert(rec_rows, on_conflict="review_id,group_id").execute()
+            except Exception:
+                pass
 
         # Record individual friend notifications if provided
         if friend_ids and review.get("id"):
@@ -149,12 +208,32 @@ def update_review(review_id: str):
         else:
             review = existing
 
-        # Add group recommendations (new shares only — insert and ignore duplicates)
+        # Expand group_ids to individual member notifications
         raw_group_ids = body.get("group_ids") or []
         group_ids = [str(g) for g in raw_group_ids if g] if isinstance(raw_group_ids, list) else []
         if group_ids:
-            rec_rows = [{"review_id": review_id, "group_id": gid} for gid in group_ids]
-            supabase.table("group_recommendations").insert(rec_rows).execute()
+            group_recipient_ids: set[str] = set()
+            for gid in group_ids:
+                members = supabase.table("group_members").select("user_id").eq("group_id", gid).execute()
+                for m in members.data:
+                    group_recipient_ids.add(m["user_id"])
+            group_recipient_ids.discard(str(user.id))
+            if group_recipient_ids:
+                group_notif_rows = [
+                    {
+                        "user_id": rid,
+                        "sender_id": str(user.id),
+                        "movie_id": existing["movie_id"],
+                        "message": "recommended a movie to you",
+                    }
+                    for rid in group_recipient_ids
+                ]
+                supabase.table("notifications").insert(group_notif_rows).execute()
+            try:
+                rec_rows = [{"review_id": review_id, "group_id": gid} for gid in group_ids]
+                supabase.table("group_recommendations").upsert(rec_rows, on_conflict="review_id,group_id").execute()
+            except Exception:
+                pass
 
         # Send individual friend notifications
         raw_friend_ids = body.get("friend_ids") or []
@@ -296,13 +375,25 @@ def my_reviews():
     try:
         result = (
             supabase.table("reviews")
-            .select("*, movies(id, title, poster_path, release_date)")
+            .select("*, movies(id, title, poster_path, release_date, vote_average, genre_ids)")
             .eq("user_id", str(user.id))
             .order("created_at", desc=True)
             .range(offset, offset + page_size - 1)
             .execute()
         )
-        return jsonify({"reviews": result.data, "page": page, "page_size": page_size})
+        reviews = result.data
+        # Enrich movies missing genre_ids or vote_average from TMDB (cached)
+        movie_map: dict[int, dict] = {}
+        for rev in reviews:
+            m = rev.get("movies")
+            if m and m["id"] not in movie_map:
+                movie_map[m["id"]] = m
+        enriched_movies = _enrich_movies(list(movie_map.values()), supabase)
+        enriched_map = {m["id"]: m for m in enriched_movies if m}
+        for rev in reviews:
+            if rev.get("movies") and rev["movies"]["id"] in enriched_map:
+                rev["movies"] = enriched_map[rev["movies"]["id"]]
+        return jsonify({"reviews": reviews, "page": page, "page_size": page_size})
     except Exception as exc:
         return jsonify({"error": "Failed to fetch reviews", "detail": str(exc)}), 500
 
