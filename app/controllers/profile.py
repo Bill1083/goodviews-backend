@@ -84,3 +84,45 @@ def update_profile():
         return jsonify(result.data[0] if result.data else {})
     except Exception as exc:
         return jsonify({"error": "Failed to update profile", "detail": str(exc)}), 500
+
+
+@profile_bp.delete("/")
+@require_auth
+@limiter.limit("3 per hour")
+def delete_account():
+    """Permanently delete the authenticated user's account and all associated data.
+
+    The caller must confirm by supplying their username in the request body.
+    Deletion of auth.users cascades to profiles → all related tables (CASCADE).
+    """
+    user = request.current_user
+    body = request.get_json(silent=True) or {}
+    supabase = get_supabase()
+
+    confirm_username = sanitize_str(body.get("confirm_username", ""), max_length=50)
+    if not confirm_username:
+        return jsonify({"error": "confirm_username is required"}), 400
+
+    # Verify the supplied username matches the authenticated user
+    try:
+        profile_result = (
+            supabase.table("profiles")
+            .select("username")
+            .eq("id", str(user.id))
+            .single()
+            .execute()
+        )
+    except Exception as exc:
+        return jsonify({"error": "Failed to fetch profile", "detail": str(exc)}), 500
+
+    actual_username = profile_result.data.get("username", "") if profile_result.data else ""
+    if confirm_username != actual_username:
+        return jsonify({"error": "Username does not match"}), 409
+
+    # Delete the auth user — all app data cascades via DB foreign keys
+    try:
+        supabase.auth.admin.delete_user(str(user.id))
+    except Exception as exc:
+        return jsonify({"error": "Failed to delete account", "detail": str(exc)}), 500
+
+    return jsonify({"message": "Account deleted"}), 200
