@@ -66,6 +66,9 @@ def create_review():
         result = supabase.table("reviews").insert(review_payload).execute()
         review = result.data[0]
 
+        # Auto-remove from watchlist when a review is written
+        supabase.table("watchlist").delete().eq("user_id", str(user.id)).eq("movie_id", movie_id).execute()
+
         # Record group recommendations if provided
         if group_ids and review.get("id"):
             rec_rows = [{"review_id": review["id"], "group_id": gid} for gid in group_ids]

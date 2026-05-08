@@ -69,10 +69,30 @@ def search_movies(query: str, page: int = 1) -> dict:
 
 
 def get_movie_details(movie_id: int) -> dict:
-    cache_key = f"tmdb:movie:{movie_id}"
+    cache_key = f"tmdb:movie:{movie_id}:with_credits"
     cached = _cache_get(cache_key)
     if cached:
         return cached
-    data = _tmdb_get(f"/movie/{movie_id}")
+    data = _tmdb_get(f"/movie/{movie_id}", {"append_to_response": "credits"})
+    _cache_set(cache_key, data)
+    return data
+
+
+def search_people(query: str, page: int = 1) -> dict:
+    cache_key = f"tmdb:people:search:{query}:{page}"
+    cached = _cache_get(cache_key)
+    if cached:
+        return cached
+    data = _tmdb_get("/search/person", {"query": query, "page": page, "include_adult": False})
+    _cache_set(cache_key, data)
+    return data
+
+
+def get_person_details(person_id: int) -> dict:
+    cache_key = f"tmdb:person:{person_id}"
+    cached = _cache_get(cache_key)
+    if cached:
+        return cached
+    data = _tmdb_get(f"/person/{person_id}", {"append_to_response": "movie_credits"})
     _cache_set(cache_key, data)
     return data
