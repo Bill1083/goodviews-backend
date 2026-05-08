@@ -1,4 +1,5 @@
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, current_app, jsonify, request
+import requests as http_requests
 
 from app import limiter
 from app.utils.auth import require_auth
@@ -119,9 +120,22 @@ def delete_account():
     if confirm_username != actual_username:
         return jsonify({"error": "Username does not match"}), 409
 
-    # Delete the auth user — all app data cascades via DB foreign keys
+    # Delete the auth user via the Admin REST API — all app data cascades via DB foreign keys
     try:
-        supabase.auth.admin.delete_user(str(user.id))
+        supabase_url = current_app.config["SUPABASE_URL"]
+        service_key = current_app.config["SUPABASE_SERVICE_ROLE_KEY"]
+
+        resp = http_requests.delete(
+            f"{supabase_url}/auth/v1/admin/users/{user.id}",
+            headers={
+                "apikey": service_key,
+                "Authorization": f"Bearer {service_key}",
+            },
+            timeout=10,
+        )
+        if resp.status_code not in (200, 204):
+            error_msg = resp.json().get("message", resp.text) if resp.text else "Unknown error"
+            return jsonify({"error": "Failed to delete account", "detail": error_msg}), 500
     except Exception as exc:
         return jsonify({"error": "Failed to delete account", "detail": str(exc)}), 500
 
