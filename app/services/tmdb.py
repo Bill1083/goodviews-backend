@@ -70,6 +70,8 @@ def search_movies(query: str, page: int = 1) -> dict:
     if cached:
         return cached
     data = _tmdb_get("/search/movie", {"query": query, "page": page})
+    if "results" in data:
+        data["results"] = sorted(data["results"], key=lambda m: m.get("popularity", 0), reverse=True)
     _cache_set(cache_key, data)
     return data
 
@@ -90,6 +92,8 @@ def search_people(query: str, page: int = 1) -> dict:
     if cached:
         return cached
     data = _tmdb_get("/search/person", {"query": query, "page": page, "include_adult": False})
+    if "results" in data:
+        data["results"] = sorted(data["results"], key=lambda p: p.get("popularity", 0), reverse=True)
     _cache_set(cache_key, data)
     return data
 
