@@ -51,11 +51,19 @@ def _tmdb_get(path: str, params: dict | None = None) -> dict:
     api_key = current_app.config["TMDB_API_KEY"]
     base_url = current_app.config["TMDB_BASE_URL"]
     merged_params = {"api_key": api_key, **(params or {})}
-    response = requests.get(
-        f"{base_url}{path}", params=merged_params, timeout=10
-    )
-    response.raise_for_status()
-    return response.json()
+    last_exc: Exception | None = None
+    for attempt in range(3):
+        try:
+            response = requests.get(
+                f"{base_url}{path}", params=merged_params, timeout=10
+            )
+            response.raise_for_status()
+            return response.json()
+        except (requests.ConnectionError, requests.Timeout) as exc:
+            last_exc = exc
+            if attempt < 2:
+                import time; time.sleep(0.3 * (attempt + 1))
+    raise last_exc
 
 
 def search_movies(query: str, page: int = 1) -> dict:
