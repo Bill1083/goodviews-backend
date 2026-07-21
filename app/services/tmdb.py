@@ -52,7 +52,7 @@ def _tmdb_get(path: str, params: dict | None = None) -> dict:
     base_url = current_app.config["TMDB_BASE_URL"]
     merged_params = {"api_key": api_key, **(params or {})}
     last_exc: Exception | None = None
-    for attempt in range(3):
+    for attempt in range(2):
         try:
             response = requests.get(
                 f"{base_url}{path}", params=merged_params, timeout=10
@@ -61,8 +61,6 @@ def _tmdb_get(path: str, params: dict | None = None) -> dict:
             return response.json()
         except (requests.ConnectionError, requests.Timeout) as exc:
             last_exc = exc
-            if attempt < 2:
-                import time; time.sleep(0.3 * (attempt + 1))
     raise last_exc
 
 
