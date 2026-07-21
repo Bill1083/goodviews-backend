@@ -10,7 +10,7 @@ movies_bp = Blueprint("movies", __name__)
 
 
 @movies_bp.get("/search")
-@limiter.limit("30 per minute")
+@limiter.limit("60 per minute")
 def search():
     query = request.args.get("q", "").strip()
     if not query:

@@ -15,3 +15,4 @@ class Config:
     # Rate limiting
     RATELIMIT_DEFAULT = "200 per day;50 per hour"
     RATELIMIT_STORAGE_URI = os.getenv("REDIS_URL", "memory://")
+    RATELIMIT_SWALLOW_ERRORS = True
