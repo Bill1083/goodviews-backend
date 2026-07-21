@@ -64,16 +64,21 @@ def _tmdb_get(path: str, params: dict | None = None) -> dict:
     raise last_exc
 
 
+def _sort_by_popularity(data: dict, key: str = "popularity") -> dict:
+    """Sort the results list in a TMDB response by popularity descending."""
+    if "results" in data:
+        data["results"] = sorted(data["results"], key=lambda item: item.get(key, 0), reverse=True)
+    return data
+
+
 def search_movies(query: str, page: int = 1) -> dict:
     cache_key = f"tmdb:search:{query}:{page}"
     cached = _cache_get(cache_key)
     if cached:
-        return cached
+        return _sort_by_popularity(cached)
     data = _tmdb_get("/search/movie", {"query": query, "page": page})
-    if "results" in data:
-        data["results"] = sorted(data["results"], key=lambda m: m.get("popularity", 0), reverse=True)
     _cache_set(cache_key, data)
-    return data
+    return _sort_by_popularity(data)
 
 
 def get_movie_details(movie_id: int) -> dict:
@@ -90,12 +95,10 @@ def search_people(query: str, page: int = 1) -> dict:
     cache_key = f"tmdb:people:search:{query}:{page}"
     cached = _cache_get(cache_key)
     if cached:
-        return cached
+        return _sort_by_popularity(cached)
     data = _tmdb_get("/search/person", {"query": query, "page": page, "include_adult": False})
-    if "results" in data:
-        data["results"] = sorted(data["results"], key=lambda p: p.get("popularity", 0), reverse=True)
     _cache_set(cache_key, data)
-    return data
+    return _sort_by_popularity(data)
 
 
 def get_person_details(person_id: int) -> dict:
