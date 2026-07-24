@@ -1,3 +1,5 @@
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 from flask import Blueprint, jsonify, request
 
 from app import limiter
@@ -10,35 +12,51 @@ reviews_bp = Blueprint("reviews", __name__)
 
 
 def _enrich_movies(movies: list[dict], supabase) -> list[dict]:
-    """Backfill genre_ids and vote_average for movies missing those fields, using cached TMDB data."""
-    enriched = []
-    db_updates = []
-    for movie in movies:
-        if movie is None:
-            enriched.append(movie)
-            continue
-        needs_genre = movie.get("genre_ids") is None
-        needs_vote = movie.get("vote_average") is None
-        if needs_genre or needs_vote:
-            try:
-                details = tmdb_service.get_movie_details(movie["id"])
-                update: dict = {}
-                if needs_genre and details.get("genres"):
-                    update["genre_ids"] = [g["id"] for g in details["genres"]]
-                if needs_vote and details.get("vote_average") is not None:
-                    update["vote_average"] = details["vote_average"]
-                if update:
-                    db_updates.append({"id": movie["id"], **update})
-                    movie = {**movie, **update}
-            except Exception:
-                pass
-        enriched.append(movie)
+    """Backfill genre_ids and vote_average for movies missing those fields.
+    Uses parallel TMDB requests so a cold cache doesn't block serially.
+    """
+    # Build a unique map; skip movies that already have both fields
+    movie_map: dict[int, dict] = {}
+    for m in movies:
+        if m and m["id"] not in movie_map:
+            movie_map[m["id"]] = dict(m)
+
+    to_enrich = {
+        mid: m for mid, m in movie_map.items()
+        if m.get("genre_ids") is None or m.get("vote_average") is None
+    }
+
+    if not to_enrich:
+        return movies
+
+    def _fetch_one(movie_id: int, movie: dict) -> tuple[int, dict]:
+        try:
+            details = tmdb_service.get_movie_basic(movie_id)
+            update: dict = {}
+            if movie.get("genre_ids") is None and details.get("genres"):
+                update["genre_ids"] = [g["id"] for g in details["genres"]]
+            if movie.get("vote_average") is None and details.get("vote_average") is not None:
+                update["vote_average"] = details["vote_average"]
+            return movie_id, update
+        except Exception:
+            return movie_id, {}
+
+    db_updates: list[dict] = []
+    with ThreadPoolExecutor(max_workers=min(len(to_enrich), 10)) as executor:
+        futures = {executor.submit(_fetch_one, mid, m): mid for mid, m in to_enrich.items()}
+        for future in as_completed(futures):
+            mid, update = future.result()
+            if update:
+                movie_map[mid].update(update)
+                db_updates.append({"id": mid, **update})
+
     if db_updates:
         try:
             supabase.table("movies").upsert(db_updates, on_conflict="id").execute()
         except Exception:
             pass
-    return enriched
+
+    return [movie_map.get(m["id"], m) if m else m for m in movies]
 
 
 @reviews_bp.post("/")

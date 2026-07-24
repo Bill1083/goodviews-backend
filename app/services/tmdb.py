@@ -91,6 +91,22 @@ def get_movie_details(movie_id: int) -> dict:
     return data
 
 
+def get_movie_basic(movie_id: int) -> dict:
+    """Lightweight movie fetch (no credits) used only for genre/rating enrichment.
+    Reuses the full-details cache when already available to avoid a redundant call."""
+    full_cache_key = f"tmdb:movie:{movie_id}:with_credits"
+    cached_full = _cache_get(full_cache_key)
+    if cached_full:
+        return cached_full
+    cache_key = f"tmdb:movie:{movie_id}:basic"
+    cached = _cache_get(cache_key)
+    if cached:
+        return cached
+    data = _tmdb_get(f"/movie/{movie_id}")
+    _cache_set(cache_key, data)
+    return data
+
+
 def search_people(query: str, page: int = 1) -> dict:
     cache_key = f"tmdb:people:search:{query}:{page}"
     cached = _cache_get(cache_key)
