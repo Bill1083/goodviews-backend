@@ -107,6 +107,29 @@ def get_movie_basic(movie_id: int) -> dict:
     return data
 
 
+def get_trending_movies(page: int = 1) -> dict:
+    """Most popular / most talked-about movies this week (TMDB trending)."""
+    cache_key = f"tmdb:trending:week:{page}"
+    cached = _cache_get(cache_key)
+    if cached:
+        return cached
+    data = _tmdb_get("/trending/movie/week", {"page": page})
+    _cache_set(cache_key, data)
+    return data
+
+
+def get_top_rated_movies(page: int = 1) -> dict:
+    """All-time top-rated movies, used as a placeholder feed until personalized
+    'For You' recommendations exist."""
+    cache_key = f"tmdb:top_rated:{page}"
+    cached = _cache_get(cache_key)
+    if cached:
+        return cached
+    data = _tmdb_get("/movie/top_rated", {"page": page})
+    _cache_set(cache_key, data)
+    return data
+
+
 def search_people(query: str, page: int = 1) -> dict:
     cache_key = f"tmdb:people:search:{query}:{page}"
     cached = _cache_get(cache_key)

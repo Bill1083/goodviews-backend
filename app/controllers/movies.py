@@ -28,6 +28,34 @@ def search():
         return jsonify({"error": "Failed to fetch movies", "detail": str(exc)}), 502
 
 
+@movies_bp.get("/trending")
+@limiter.limit("60 per minute")
+def trending():
+    """Most popular / most talked-about movies this week."""
+    page = request.args.get("page", 1, type=int)
+    page = max(1, min(page, 500))
+
+    try:
+        data = tmdb.get_trending_movies(page)
+        return jsonify(data)
+    except Exception as exc:
+        return jsonify({"error": "Failed to fetch trending movies", "detail": str(exc)}), 502
+
+
+@movies_bp.get("/top-rated")
+@limiter.limit("60 per minute")
+def top_rated():
+    """All-time top-rated movies (placeholder feed for 'For You')."""
+    page = request.args.get("page", 1, type=int)
+    page = max(1, min(page, 500))
+
+    try:
+        data = tmdb.get_top_rated_movies(page)
+        return jsonify(data)
+    except Exception as exc:
+        return jsonify({"error": "Failed to fetch top rated movies", "detail": str(exc)}), 502
+
+
 @movies_bp.get("/<int:movie_id>")
 @limiter.limit("60 per minute")
 def details(movie_id: int):
