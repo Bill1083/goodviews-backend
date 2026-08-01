@@ -82,11 +82,13 @@ def search_movies(query: str, page: int = 1) -> dict:
 
 
 def get_movie_details(movie_id: int) -> dict:
-    cache_key = f"tmdb:movie:{movie_id}:with_credits"
+    # Cache key includes "providers" so we don't serve a stale payload (missing
+    # watch/providers) that was cached before that field was added to the request.
+    cache_key = f"tmdb:movie:{movie_id}:with_credits_providers"
     cached = _cache_get(cache_key)
     if cached:
         return cached
-    data = _tmdb_get(f"/movie/{movie_id}", {"append_to_response": "credits"})
+    data = _tmdb_get(f"/movie/{movie_id}", {"append_to_response": "credits,watch/providers"})
     _cache_set(cache_key, data)
     return data
 
@@ -94,7 +96,7 @@ def get_movie_details(movie_id: int) -> dict:
 def get_movie_basic(movie_id: int) -> dict:
     """Lightweight movie fetch (no credits) used only for genre/rating enrichment.
     Reuses the full-details cache when already available to avoid a redundant call."""
-    full_cache_key = f"tmdb:movie:{movie_id}:with_credits"
+    full_cache_key = f"tmdb:movie:{movie_id}:with_credits_providers"
     cached_full = _cache_get(full_cache_key)
     if cached_full:
         return cached_full
