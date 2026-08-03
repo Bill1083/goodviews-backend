@@ -3,6 +3,7 @@ from flask import Blueprint, jsonify, request
 from app import limiter
 from app.utils.auth import require_auth
 from app.utils.sanitize import sanitize_text
+from app.utils.social import filter_friend_ids, filter_owned_group_ids
 from app.services import tmdb
 from app.services.supabase_client import get_supabase
 
@@ -94,10 +95,14 @@ def recommend_movie():
     try:
         supabase.table("movies").upsert(movie_data, on_conflict="id").execute()
 
-        recipient_ids: set[str] = set(friend_ids)
+        # Only fan out to friends the caller actually has, and groups they actually
+        # own — otherwise any logged-in user could spam arbitrary users/probe group
+        # sizes by passing IDs they found or guessed.
+        recipient_ids: set[str] = filter_friend_ids(supabase, str(user.id), friend_ids)
+        allowed_group_ids = filter_owned_group_ids(supabase, str(user.id), group_ids)
 
         # Expand groups to member user_ids
-        for gid in group_ids:
+        for gid in allowed_group_ids:
             members = (
                 supabase.table("group_members")
                 .select("user_id")
