@@ -4,6 +4,7 @@ from app import limiter
 from app.utils.auth import require_auth
 from app.utils.sanitize import sanitize_text
 from app.services.supabase_client import get_supabase
+from app.utils.errors import server_error
 
 favourites_bp = Blueprint("favourites", __name__)
 
@@ -26,7 +27,7 @@ def get_favourite_actors():
         )
         return jsonify(result.data), 200
     except Exception as exc:
-        return jsonify({"error": "Failed to fetch favourite actors", "detail": str(exc)}), 500
+        return server_error("Failed to fetch favourite actors", exc, 500)
 
 
 @favourites_bp.post("/actors")
@@ -58,7 +59,7 @@ def add_favourite_actor():
         ).execute()
         return jsonify({"ok": True}), 201
     except Exception as exc:
-        return jsonify({"error": "Failed to add favourite actor", "detail": str(exc)}), 500
+        return server_error("Failed to add favourite actor", exc, 500)
 
 
 @favourites_bp.delete("/actors/<int:person_id>")
@@ -71,7 +72,7 @@ def remove_favourite_actor(person_id: int):
         supabase.table("favorite_actors").delete().eq("user_id", str(user.id)).eq("actor_id", person_id).execute()
         return jsonify({"ok": True}), 200
     except Exception as exc:
-        return jsonify({"error": "Failed to remove favourite actor", "detail": str(exc)}), 500
+        return server_error("Failed to remove favourite actor", exc, 500)
 
 
 # ─── Favourite Directors ──────────────────────────────────────────────────────
@@ -92,7 +93,7 @@ def get_favourite_directors():
         )
         return jsonify(result.data), 200
     except Exception as exc:
-        return jsonify({"error": "Failed to fetch favourite directors", "detail": str(exc)}), 500
+        return server_error("Failed to fetch favourite directors", exc, 500)
 
 
 @favourites_bp.post("/directors")
@@ -124,7 +125,7 @@ def add_favourite_director():
         ).execute()
         return jsonify({"ok": True}), 201
     except Exception as exc:
-        return jsonify({"error": "Failed to add favourite director", "detail": str(exc)}), 500
+        return server_error("Failed to add favourite director", exc, 500)
 
 
 @favourites_bp.delete("/directors/<int:person_id>")
@@ -137,4 +138,4 @@ def remove_favourite_director(person_id: int):
         supabase.table("favorite_directors").delete().eq("user_id", str(user.id)).eq("director_id", person_id).execute()
         return jsonify({"ok": True}), 200
     except Exception as exc:
-        return jsonify({"error": "Failed to remove favourite director", "detail": str(exc)}), 500
+        return server_error("Failed to remove favourite director", exc, 500)

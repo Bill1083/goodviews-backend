@@ -8,6 +8,7 @@ from app.utils.sanitize import sanitize_text
 from app.utils.social import filter_friend_ids, filter_owned_group_ids
 from app.services.supabase_client import get_supabase
 from app.services import tmdb as tmdb_service
+from app.utils.errors import server_error
 
 reviews_bp = Blueprint("reviews", __name__)
 
@@ -173,7 +174,7 @@ def create_review():
 
         return jsonify(review), 201
     except Exception as exc:
-        return jsonify({"error": "Failed to save review", "detail": str(exc)}), 500
+        return server_error("Failed to save review", exc, 500)
 
 
 @reviews_bp.put("/<review_id>")
@@ -280,7 +281,7 @@ def update_review(review_id: str):
 
         return jsonify(review), 200
     except Exception as exc:
-        return jsonify({"error": "Failed to update review", "detail": str(exc)}), 500
+        return server_error("Failed to update review", exc, 500)
 
 
 @reviews_bp.patch("/<review_id>/rewatch")
@@ -306,7 +307,7 @@ def increment_rewatch(review_id: str):
         supabase.table("reviews").update({"rewatch_count": new_count}).eq("id", review_id).eq("user_id", str(user.id)).execute()
         return jsonify({"rewatch_count": new_count}), 200
     except Exception as exc:
-        return jsonify({"error": "Failed to update rewatch count", "detail": str(exc)}), 500
+        return server_error("Failed to update rewatch count", exc, 500)
 
 
 @reviews_bp.patch("/<review_id>/rewatch/decrement")
@@ -332,7 +333,7 @@ def decrement_rewatch(review_id: str):
         supabase.table("reviews").update({"rewatch_count": new_count}).eq("id", review_id).eq("user_id", str(user.id)).execute()
         return jsonify({"rewatch_count": new_count}), 200
     except Exception as exc:
-        return jsonify({"error": "Failed to update rewatch count", "detail": str(exc)}), 500
+        return server_error("Failed to update rewatch count", exc, 500)
 
 
 @reviews_bp.get("/bulk-friend-ratings")
@@ -387,7 +388,7 @@ def bulk_friend_ratings():
 
         return jsonify(result)
     except Exception as exc:
-        return jsonify({"error": "Failed to fetch bulk ratings", "detail": str(exc)}), 500
+        return server_error("Failed to fetch bulk ratings", exc, 500)
 
 
 @reviews_bp.get("/me")
@@ -423,7 +424,7 @@ def my_reviews():
                 rev["movies"] = enriched_map[rev["movies"]["id"]]
         return jsonify({"reviews": reviews, "page": page, "page_size": page_size})
     except Exception as exc:
-        return jsonify({"error": "Failed to fetch reviews", "detail": str(exc)}), 500
+        return server_error("Failed to fetch reviews", exc, 500)
 
 
 @reviews_bp.delete("/<review_id>")
@@ -443,7 +444,7 @@ def delete_review(review_id: str):
             return jsonify({"error": "Review not found or not owned by user"}), 404
         return jsonify({"deleted": True}), 200
     except Exception as exc:
-        return jsonify({"error": "Failed to delete review", "detail": str(exc)}), 500
+        return server_error("Failed to delete review", exc, 500)
 
 
 @reviews_bp.get("/movie/<int:movie_id>")
@@ -501,4 +502,4 @@ def movie_reviews(movie_id: int):
             "avg_friend_rating": avg_rating,
         })
     except Exception as exc:
-        return jsonify({"error": "Failed to fetch movie reviews", "detail": str(exc)}), 500
+        return server_error("Failed to fetch movie reviews", exc, 500)

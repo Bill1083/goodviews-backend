@@ -3,6 +3,7 @@ from flask import Blueprint, jsonify, request
 from app import limiter
 from app.utils.auth import require_auth
 from app.services.tmdb import search_people, get_person_details
+from app.utils.errors import server_error
 
 people_bp = Blueprint("people", __name__)
 
@@ -23,7 +24,7 @@ def search_people_endpoint():
         data = search_people(q, page)
         return jsonify(data), 200
     except Exception as exc:
-        return jsonify({"error": "Failed to search people", "detail": str(exc)}), 500
+        return server_error("Failed to search people", exc, 500)
 
 
 @people_bp.get("/<int:person_id>")
@@ -34,4 +35,4 @@ def get_person(person_id: int):
         data = get_person_details(person_id)
         return jsonify(data), 200
     except Exception as exc:
-        return jsonify({"error": "Failed to fetch person details", "detail": str(exc)}), 500
+        return server_error("Failed to fetch person details", exc, 500)

@@ -3,6 +3,7 @@ from flask import Blueprint, jsonify, request
 from app import limiter
 from app.utils.auth import require_auth
 from app.services.supabase_client import get_supabase
+from app.utils.errors import server_error
 
 notifications_bp = Blueprint("notifications", __name__)
 
@@ -61,7 +62,7 @@ def get_recommendations():
 
         return jsonify(notifs)
     except Exception as exc:
-        return jsonify({"error": "Failed to fetch recommendations", "detail": str(exc)}), 500
+        return server_error("Failed to fetch recommendations", exc, 500)
 
 
 @notifications_bp.patch("/<notif_id>/read")
@@ -83,7 +84,7 @@ def mark_read(notif_id: str):
             return jsonify({"error": "Notification not found"}), 404
         return jsonify({"updated": True}), 200
     except Exception as exc:
-        return jsonify({"error": "Failed to mark read", "detail": str(exc)}), 500
+        return server_error("Failed to mark read", exc, 500)
 
 
 @notifications_bp.patch("/<notif_id>/dismiss")
@@ -105,4 +106,4 @@ def dismiss(notif_id: str):
             return jsonify({"error": "Notification not found"}), 404
         return jsonify({"dismissed": True}), 200
     except Exception as exc:
-        return jsonify({"error": "Failed to dismiss notification", "detail": str(exc)}), 500
+        return server_error("Failed to dismiss notification", exc, 500)

@@ -6,6 +6,7 @@ from app import limiter
 from app.utils.auth import require_auth
 from app.utils.sanitize import sanitize_text
 from app.services.supabase_client import get_supabase
+from app.utils.errors import server_error
 
 categories_bp = Blueprint("categories", __name__)
 
@@ -32,7 +33,7 @@ def list_categories():
         )
         return jsonify(result.data)
     except Exception as exc:
-        return jsonify({"error": "Failed to fetch categories", "detail": str(exc)}), 500
+        return server_error("Failed to fetch categories", exc, 500)
 
 
 @categories_bp.post("/")
@@ -69,7 +70,7 @@ def create_category():
         )
         return jsonify(result.data[0]), 201
     except Exception as exc:
-        return jsonify({"error": "Failed to create category", "detail": str(exc)}), 500
+        return server_error("Failed to create category", exc, 500)
 
 
 @categories_bp.put("/<category_id>")
@@ -123,7 +124,7 @@ def update_category(category_id):
         )
         return jsonify(result.data[0])
     except Exception as exc:
-        return jsonify({"error": "Failed to update category", "detail": str(exc)}), 500
+        return server_error("Failed to update category", exc, 500)
 
 
 @categories_bp.delete("/<category_id>")
@@ -147,4 +148,4 @@ def delete_category(category_id):
         supabase.table("categories").delete().eq("id", category_id).execute()
         return jsonify({"message": "Deleted"}), 200
     except Exception as exc:
-        return jsonify({"error": "Failed to delete category", "detail": str(exc)}), 500
+        return server_error("Failed to delete category", exc, 500)

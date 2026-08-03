@@ -5,6 +5,7 @@ from app import limiter
 from app.utils.auth import require_auth
 from app.utils.sanitize import sanitize_str
 from app.services.supabase_client import get_supabase
+from app.utils.errors import server_error
 
 profile_bp = Blueprint("profile", __name__)
 
@@ -27,7 +28,7 @@ def get_profile():
         )
         return jsonify(result.data)
     except Exception as exc:
-        return jsonify({"error": "Failed to fetch profile", "detail": str(exc)}), 500
+        return server_error("Failed to fetch profile", exc, 500)
 
 
 @profile_bp.put("/")
@@ -90,7 +91,7 @@ def update_profile():
         )
         return jsonify(result.data[0] if result.data else {})
     except Exception as exc:
-        return jsonify({"error": "Failed to update profile", "detail": str(exc)}), 500
+        return server_error("Failed to update profile", exc, 500)
 
 
 @profile_bp.delete("/")
@@ -120,7 +121,7 @@ def delete_account():
             .execute()
         )
     except Exception as exc:
-        return jsonify({"error": "Failed to fetch profile", "detail": str(exc)}), 500
+        return server_error("Failed to fetch profile", exc, 500)
 
     actual_username = profile_result.data.get("username", "") if profile_result.data else ""
     if confirm_username != actual_username:
@@ -143,6 +144,6 @@ def delete_account():
             error_msg = resp.json().get("message", resp.text) if resp.text else "Unknown error"
             return jsonify({"error": "Failed to delete account", "detail": error_msg}), 500
     except Exception as exc:
-        return jsonify({"error": "Failed to delete account", "detail": str(exc)}), 500
+        return server_error("Failed to delete account", exc, 500)
 
     return jsonify({"message": "Account deleted"}), 200

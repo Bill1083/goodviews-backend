@@ -5,6 +5,7 @@ from app.utils.auth import require_auth
 from app.utils.sanitize import sanitize_text
 from app.services.supabase_client import get_supabase
 from app.services import tmdb as tmdb_service
+from app.utils.errors import server_error
 
 watchlist_bp = Blueprint("watchlist", __name__)
 
@@ -69,7 +70,7 @@ def get_watchlist():
                 item["movies"] = enriched_map[item["movies"]["id"]]
         return jsonify(items)
     except Exception as exc:
-        return jsonify({"error": "Failed to fetch watchlist", "detail": str(exc)}), 500
+        return server_error("Failed to fetch watchlist", exc, 500)
 
 
 @watchlist_bp.post("/")
@@ -120,7 +121,7 @@ def add_to_watchlist():
         )
         return jsonify(result.data[0]), 201
     except Exception as exc:
-        return jsonify({"error": "Failed to add to watchlist", "detail": str(exc)}), 500
+        return server_error("Failed to add to watchlist", exc, 500)
 
 
 @watchlist_bp.delete("/<int:movie_id>")
@@ -136,4 +137,4 @@ def remove_from_watchlist(movie_id: int):
             .execute()
         return jsonify({"message": "Removed from watchlist"}), 200
     except Exception as exc:
-        return jsonify({"error": "Failed to remove from watchlist", "detail": str(exc)}), 500
+        return server_error("Failed to remove from watchlist", exc, 500)

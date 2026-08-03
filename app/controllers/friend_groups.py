@@ -6,6 +6,7 @@ from app import limiter
 from app.utils.auth import require_auth
 from app.utils.sanitize import sanitize_text
 from app.services.supabase_client import get_supabase
+from app.utils.errors import server_error
 
 friend_groups_bp = Blueprint("friend_groups", __name__)
 
@@ -49,7 +50,7 @@ def list_groups():
         )
         return jsonify([_serialize_group(g) for g in result.data])
     except Exception as exc:
-        return jsonify({"error": "Failed to fetch groups", "detail": str(exc)}), 500
+        return server_error("Failed to fetch groups", exc, 500)
 
 
 @friend_groups_bp.post("/")
@@ -88,7 +89,7 @@ def create_group():
         new_group["members"] = []
         return jsonify(new_group), 201
     except Exception as exc:
-        return jsonify({"error": "Failed to create group", "detail": str(exc)}), 500
+        return server_error("Failed to create group", exc, 500)
 
 
 @friend_groups_bp.put("/<group_id>")
@@ -142,7 +143,7 @@ def update_group(group_id):
         )
         return jsonify(result.data[0])
     except Exception as exc:
-        return jsonify({"error": "Failed to update group", "detail": str(exc)}), 500
+        return server_error("Failed to update group", exc, 500)
 
 
 @friend_groups_bp.delete("/<group_id>")
@@ -166,7 +167,7 @@ def delete_group(group_id):
         supabase.table("friend_groups").delete().eq("id", group_id).execute()
         return jsonify({"message": "Deleted"}), 200
     except Exception as exc:
-        return jsonify({"error": "Failed to delete group", "detail": str(exc)}), 500
+        return server_error("Failed to delete group", exc, 500)
 
 
 @friend_groups_bp.post("/<group_id>/members")
@@ -197,7 +198,7 @@ def add_member(group_id):
         }).execute()
         return jsonify({"message": "Member added"}), 201
     except Exception as exc:
-        return jsonify({"error": "Failed to add member", "detail": str(exc)}), 500
+        return server_error("Failed to add member", exc, 500)
 
 
 @friend_groups_bp.delete("/<group_id>/members/<member_id>")
@@ -222,4 +223,4 @@ def remove_member(group_id, member_id):
             .eq("group_id", group_id).eq("user_id", member_id).execute()
         return jsonify({"message": "Member removed"}), 200
     except Exception as exc:
-        return jsonify({"error": "Failed to remove member", "detail": str(exc)}), 500
+        return server_error("Failed to remove member", exc, 500)

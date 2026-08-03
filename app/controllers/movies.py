@@ -6,6 +6,7 @@ from app.utils.sanitize import sanitize_text
 from app.utils.social import filter_friend_ids, filter_owned_group_ids
 from app.services import tmdb
 from app.services.supabase_client import get_supabase
+from app.utils.errors import server_error
 
 movies_bp = Blueprint("movies", __name__)
 
@@ -26,7 +27,7 @@ def search():
         data = tmdb.search_movies(query, page)
         return jsonify(data)
     except Exception as exc:
-        return jsonify({"error": "Failed to fetch movies", "detail": str(exc)}), 502
+        return server_error("Failed to fetch movies", exc, 502)
 
 
 @movies_bp.get("/trending")
@@ -40,7 +41,7 @@ def trending():
         data = tmdb.get_trending_movies(page)
         return jsonify(data)
     except Exception as exc:
-        return jsonify({"error": "Failed to fetch trending movies", "detail": str(exc)}), 502
+        return server_error("Failed to fetch trending movies", exc, 502)
 
 
 @movies_bp.get("/top-rated")
@@ -54,7 +55,7 @@ def top_rated():
         data = tmdb.get_top_rated_movies(page)
         return jsonify(data)
     except Exception as exc:
-        return jsonify({"error": "Failed to fetch top rated movies", "detail": str(exc)}), 502
+        return server_error("Failed to fetch top rated movies", exc, 502)
 
 
 @movies_bp.get("/<int:movie_id>")
@@ -64,7 +65,7 @@ def details(movie_id: int):
         data = tmdb.get_movie_details(movie_id)
         return jsonify(data)
     except Exception as exc:
-        return jsonify({"error": "Failed to fetch movie details", "detail": str(exc)}), 502
+        return server_error("Failed to fetch movie details", exc, 502)
 
 
 @movies_bp.post("/recommend")
@@ -129,4 +130,4 @@ def recommend_movie():
 
         return jsonify({"message": "Sent", "recipient_count": len(recipient_ids)}), 200
     except Exception as exc:
-        return jsonify({"error": "Failed to send recommendation", "detail": str(exc)}), 500
+        return server_error("Failed to send recommendation", exc, 500)

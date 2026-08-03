@@ -2,6 +2,7 @@ from flask import Blueprint, jsonify, request
 
 from app import limiter
 from app.services.supabase_client import get_supabase
+from app.utils.errors import server_error
 
 auth_bp = Blueprint("auth", __name__)
 
@@ -45,6 +46,6 @@ def resolve_login():
         user_response = supabase.auth.admin.get_user_by_id(user_id)
         email = user_response.user.email
     except Exception as exc:
-        return jsonify({"error": "Failed to resolve user", "detail": str(exc)}), 500
+        return server_error("Failed to resolve user", exc, 500)
 
     return jsonify({"email": email})

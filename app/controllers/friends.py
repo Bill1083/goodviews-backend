@@ -3,6 +3,7 @@ from flask import Blueprint, jsonify, request
 from app import limiter
 from app.utils.auth import require_auth
 from app.services.supabase_client import get_supabase
+from app.utils.errors import server_error
 
 friends_bp = Blueprint("friends", __name__)
 
@@ -54,7 +55,7 @@ def search_users():
         ]
         return jsonify(results)
     except Exception as exc:
-        return jsonify({"error": "Search failed", "detail": str(exc)}), 500
+        return server_error("Search failed", exc, 500)
 
 
 @friends_bp.get("/")
@@ -78,7 +79,7 @@ def list_friends():
         ]
         return jsonify(friends)
     except Exception as exc:
-        return jsonify({"error": "Failed to fetch friends", "detail": str(exc)}), 500
+        return server_error("Failed to fetch friends", exc, 500)
 
 
 @friends_bp.get("/recent-activity")
@@ -139,7 +140,7 @@ def friends_recent_activity():
         result = [v for v in by_friend.values() if v["reviews"]]
         return jsonify(result)
     except Exception as exc:
-        return jsonify({"error": "Failed to fetch friend activity", "detail": str(exc)}), 500
+        return server_error("Failed to fetch friend activity", exc, 500)
 
 
 @friends_bp.post("/")
@@ -198,7 +199,7 @@ def send_friend_request():
                 .eq("sender_id", friend_id).eq("receiver_id", str(user.id)).execute()
             return jsonify({"message": "Friend added"}), 201
         except Exception as exc:
-            return jsonify({"error": "Failed to add friend", "detail": str(exc)}), 500
+            return server_error("Failed to add friend", exc, 500)
 
     # Create the request
     try:
@@ -207,7 +208,7 @@ def send_friend_request():
         ]).execute()
         return jsonify({"message": "Friend request sent"}), 201
     except Exception as exc:
-        return jsonify({"error": "Failed to send request", "detail": str(exc)}), 500
+        return server_error("Failed to send request", exc, 500)
 
 
 @friends_bp.get("/requests")
@@ -236,7 +237,7 @@ def get_friend_requests():
         ]
         return jsonify(requests_data)
     except Exception as exc:
-        return jsonify({"error": "Failed to fetch requests", "detail": str(exc)}), 500
+        return server_error("Failed to fetch requests", exc, 500)
 
 
 @friends_bp.post("/requests/<request_id>/accept")
@@ -265,7 +266,7 @@ def accept_friend_request(request_id):
         supabase.table("friend_requests").delete().eq("id", request_id).execute()
         return jsonify({"message": "Friend request accepted"}), 200
     except Exception as exc:
-        return jsonify({"error": "Failed to accept request", "detail": str(exc)}), 500
+        return server_error("Failed to accept request", exc, 500)
 
 
 @friends_bp.delete("/requests/<request_id>")
@@ -289,7 +290,7 @@ def deny_friend_request(request_id):
         supabase.table("friend_requests").delete().eq("id", request_id).execute()
         return jsonify({"message": "Friend request denied"}), 200
     except Exception as exc:
-        return jsonify({"error": "Failed to deny request", "detail": str(exc)}), 500
+        return server_error("Failed to deny request", exc, 500)
 
 
 @friends_bp.delete("/<friend_id>")
@@ -305,4 +306,4 @@ def remove_friend(friend_id):
             .eq("user_id", friend_id).eq("friend_id", str(user.id)).execute()
         return jsonify({"message": "Friend removed"}), 200
     except Exception as exc:
-        return jsonify({"error": "Failed to remove friend", "detail": str(exc)}), 500
+        return server_error("Failed to remove friend", exc, 500)
