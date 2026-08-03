@@ -20,7 +20,7 @@ def get_profile():
     try:
         result = (
             supabase.table("profiles")
-            .select("id, username, bio, profile_visibility, avatar_color, hide_recent_movies")
+            .select("id, username, bio, profile_visibility, avatar_color, hide_recent_movies, mute_recommendations, mute_friend_requests")
             .eq("id", str(user.id))
             .single()
             .execute()
@@ -71,6 +71,12 @@ def update_profile():
 
     if "hide_recent_movies" in body:
         updates["hide_recent_movies"] = bool(body["hide_recent_movies"])
+
+    if "mute_recommendations" in body:
+        updates["mute_recommendations"] = bool(body["mute_recommendations"])
+
+    if "mute_friend_requests" in body:
+        updates["mute_friend_requests"] = bool(body["mute_friend_requests"])
 
     if not updates:
         return jsonify({"error": "No valid fields provided"}), 400
