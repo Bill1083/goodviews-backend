@@ -1,3 +1,5 @@
+import re
+
 from flask import Blueprint, current_app, jsonify, request
 import requests as http_requests
 
@@ -11,6 +13,10 @@ profile_bp = Blueprint("profile", __name__)
 
 VALID_VISIBILITY = ("no_one", "friends_only", "everyone")
 
+# Avatars are picked from a TMDB cast member's photo (see AvatarPicker on the client) rather
+# than uploaded, so we only ever need to accept TMDB's own image URLs here.
+_AVATAR_URL_RE = re.compile(r"^https://image\.tmdb\.org/t/p/\w+/[A-Za-z0-9]+\.(jpg|jpeg|png)$")
+
 
 @profile_bp.get("/")
 @require_auth
@@ -21,7 +27,7 @@ def get_profile():
     try:
         result = (
             supabase.table("profiles")
-            .select("id, username, bio, profile_visibility, avatar_color, hide_recent_movies, mute_recommendations, mute_friend_requests")
+            .select("id, username, bio, profile_visibility, avatar_color, avatar_url, hide_recent_movies, mute_recommendations, mute_friend_requests")
             .eq("id", str(user.id))
             .single()
             .execute()
@@ -69,6 +75,16 @@ def update_profile():
     if "avatar_color" in body:
         color = sanitize_str(body["avatar_color"], max_length=7)
         updates["avatar_color"] = color if color else None
+
+    if "avatar_url" in body:
+        url = body["avatar_url"]
+        if not url:
+            updates["avatar_url"] = None
+        else:
+            url = sanitize_str(str(url), max_length=300)
+            if not _AVATAR_URL_RE.match(url):
+                return jsonify({"error": "Invalid avatar_url"}), 400
+            updates["avatar_url"] = url
 
     if "hide_recent_movies" in body:
         updates["hide_recent_movies"] = bool(body["hide_recent_movies"])

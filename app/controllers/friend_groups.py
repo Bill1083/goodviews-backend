@@ -19,7 +19,12 @@ def _valid_color(c) -> bool:
 
 def _serialize_group(g: dict) -> dict:
     members = [
-        {"id": m["profiles"]["id"], "username": m["profiles"]["username"]}
+        {
+            "id": m["profiles"]["id"],
+            "username": m["profiles"]["username"],
+            "avatar_url": m["profiles"].get("avatar_url"),
+            "avatar_color": m["profiles"].get("avatar_color"),
+        }
         for m in (g.get("group_members") or [])
         if m.get("profiles")
     ]
@@ -43,7 +48,7 @@ def list_groups():
     try:
         result = (
             supabase.table("friend_groups")
-            .select("*, group_members(user_id, profiles!group_members_user_id_fkey(id, username))")
+            .select("*, group_members(user_id, profiles!group_members_user_id_fkey(id, username, avatar_url, avatar_color))")
             .eq("owner_id", str(user.id))
             .order("created_at")
             .execute()
