@@ -24,6 +24,8 @@ def _serialize_group(g: dict) -> dict:
             "username": m["profiles"]["username"],
             "avatar_url": m["profiles"].get("avatar_url"),
             "avatar_color": m["profiles"].get("avatar_color"),
+            "avatar_focal_y": m["profiles"].get("avatar_focal_y"),
+            "avatar_zoom": m["profiles"].get("avatar_zoom"),
         }
         for m in (g.get("group_members") or [])
         if m.get("profiles")
@@ -48,7 +50,7 @@ def list_groups():
     try:
         result = (
             supabase.table("friend_groups")
-            .select("*, group_members(user_id, profiles!group_members_user_id_fkey(id, username, avatar_url, avatar_color))")
+            .select("*, group_members(user_id, profiles!group_members_user_id_fkey(id, username, avatar_url, avatar_color, avatar_focal_y, avatar_zoom))")
             .eq("owner_id", str(user.id))
             .order("created_at")
             .execute()

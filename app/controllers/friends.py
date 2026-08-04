@@ -21,7 +21,7 @@ def search_users():
     try:
         result = (
             supabase.table("profiles")
-            .select("id, username, avatar_url, avatar_color")
+            .select("id, username, avatar_url, avatar_color, avatar_focal_y, avatar_zoom")
             .ilike("username", f"%{q}%")
             .neq("id", str(user.id))
             .limit(10)
@@ -50,6 +50,8 @@ def search_users():
                 "username": p["username"],
                 "avatar_url": p.get("avatar_url"),
                 "avatar_color": p.get("avatar_color"),
+                "avatar_focal_y": p.get("avatar_focal_y"),
+                "avatar_zoom": p.get("avatar_zoom"),
                 "is_friend": p["id"] in friend_ids,
                 "has_pending_request": p["id"] in pending_ids,
             }
@@ -69,7 +71,7 @@ def list_friends():
     try:
         result = (
             supabase.table("friendships")
-            .select("friend_id, profiles!friendships_friend_id_fkey(id, username, avatar_url, avatar_color)")
+            .select("friend_id, profiles!friendships_friend_id_fkey(id, username, avatar_url, avatar_color, avatar_focal_y, avatar_zoom)")
             .eq("user_id", str(user.id))
             .order("created_at")
             .execute()
@@ -80,6 +82,8 @@ def list_friends():
                 "username": r["profiles"]["username"],
                 "avatar_url": r["profiles"].get("avatar_url"),
                 "avatar_color": r["profiles"].get("avatar_color"),
+                "avatar_focal_y": r["profiles"].get("avatar_focal_y"),
+                "avatar_zoom": r["profiles"].get("avatar_zoom"),
             }
             for r in result.data
             if r.get("profiles")
@@ -228,7 +232,7 @@ def get_friend_requests():
     try:
         result = (
             supabase.table("friend_requests")
-            .select("id, sender_id, created_at, profiles!friend_requests_sender_id_fkey(id, username, avatar_url, avatar_color)")
+            .select("id, sender_id, created_at, profiles!friend_requests_sender_id_fkey(id, username, avatar_url, avatar_color, avatar_focal_y, avatar_zoom)")
             .eq("receiver_id", str(user.id))
             .order("created_at")
             .execute()
@@ -240,6 +244,8 @@ def get_friend_requests():
                 "sender_username": r["profiles"]["username"] if r.get("profiles") else r["sender_id"],
                 "sender_avatar_url": r["profiles"].get("avatar_url") if r.get("profiles") else None,
                 "sender_avatar_color": r["profiles"].get("avatar_color") if r.get("profiles") else None,
+                "sender_avatar_focal_y": r["profiles"].get("avatar_focal_y") if r.get("profiles") else None,
+                "sender_avatar_zoom": r["profiles"].get("avatar_zoom") if r.get("profiles") else None,
                 "created_at": r["created_at"],
             }
             for r in result.data

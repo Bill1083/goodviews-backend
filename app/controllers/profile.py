@@ -13,8 +13,8 @@ profile_bp = Blueprint("profile", __name__)
 
 VALID_VISIBILITY = ("no_one", "friends_only", "everyone")
 
-# Avatars are picked from a TMDB cast member's photo (see AvatarPicker on the client) rather
-# than uploaded, so we only ever need to accept TMDB's own image URLs here.
+# Avatars are picked from TMDB movie-poster art (see AvatarPicker on the client) rather than
+# uploaded, so we only ever need to accept TMDB's own image URLs here.
 _AVATAR_URL_RE = re.compile(r"^https://image\.tmdb\.org/t/p/\w+/[A-Za-z0-9]+\.(jpg|jpeg|png)$")
 
 
@@ -27,7 +27,7 @@ def get_profile():
     try:
         result = (
             supabase.table("profiles")
-            .select("id, username, bio, profile_visibility, avatar_color, avatar_url, hide_recent_movies, mute_recommendations, mute_friend_requests")
+            .select("id, username, bio, profile_visibility, avatar_color, avatar_url, avatar_focal_y, avatar_zoom, hide_recent_movies, mute_recommendations, mute_friend_requests")
             .eq("id", str(user.id))
             .single()
             .execute()
@@ -85,6 +85,24 @@ def update_profile():
             if not _AVATAR_URL_RE.match(url):
                 return jsonify({"error": "Invalid avatar_url"}), 400
             updates["avatar_url"] = url
+
+    if "avatar_focal_y" in body:
+        try:
+            focal_y = int(body["avatar_focal_y"])
+        except (TypeError, ValueError):
+            return jsonify({"error": "Invalid avatar_focal_y"}), 400
+        if not 0 <= focal_y <= 100:
+            return jsonify({"error": "avatar_focal_y must be between 0 and 100"}), 400
+        updates["avatar_focal_y"] = focal_y
+
+    if "avatar_zoom" in body:
+        try:
+            zoom = round(float(body["avatar_zoom"]), 2)
+        except (TypeError, ValueError):
+            return jsonify({"error": "Invalid avatar_zoom"}), 400
+        if not 1.0 <= zoom <= 2.5:
+            return jsonify({"error": "avatar_zoom must be between 1.0 and 2.5"}), 400
+        updates["avatar_zoom"] = zoom
 
     if "hide_recent_movies" in body:
         updates["hide_recent_movies"] = bool(body["hide_recent_movies"])

@@ -68,6 +68,16 @@ def details(movie_id: int):
         return server_error("Failed to fetch movie details", exc, 502)
 
 
+@movies_bp.get("/<int:movie_id>/images")
+@limiter.limit("60 per minute")
+def images(movie_id: int):
+    try:
+        data = tmdb.get_movie_images(movie_id)
+        return jsonify(data)
+    except Exception as exc:
+        return server_error("Failed to fetch movie images", exc, 502)
+
+
 @movies_bp.post("/recommend")
 @require_auth
 @limiter.limit("20 per hour")

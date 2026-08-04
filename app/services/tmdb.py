@@ -93,6 +93,19 @@ def get_movie_details(movie_id: int) -> dict:
     return data
 
 
+def get_movie_images(movie_id: int) -> dict:
+    """Poster/backdrop/logo art for a movie — kept as its own call (not appended to
+    get_movie_details) so the AvatarPicker's poster grid doesn't balloon the payload
+    of the main movie-details endpoint that every other movie view also relies on."""
+    cache_key = f"tmdb:movie:{movie_id}:images"
+    cached = _cache_get(cache_key)
+    if cached:
+        return cached
+    data = _tmdb_get(f"/movie/{movie_id}/images")
+    _cache_set(cache_key, data)
+    return data
+
+
 def get_movie_basic(movie_id: int) -> dict:
     """Lightweight movie fetch (no credits) used only for genre/rating enrichment.
     Reuses the full-details cache when already available to avoid a redundant call."""
