@@ -1,5 +1,6 @@
 import json
 import logging
+import time
 from typing import Any
 
 import redis
@@ -47,12 +48,15 @@ def _cache_set(key: str, value: Any) -> None:
         pass
 
 
+_MAX_ATTEMPTS = 6
+
+
 def _tmdb_get(path: str, params: dict | None = None) -> dict:
     api_key = current_app.config["TMDB_API_KEY"]
     base_url = current_app.config["TMDB_BASE_URL"]
     merged_params = {"api_key": api_key, **(params or {})}
     last_exc: Exception | None = None
-    for attempt in range(2):
+    for attempt in range(_MAX_ATTEMPTS):
         try:
             response = requests.get(
                 f"{base_url}{path}", params=merged_params, timeout=10
@@ -61,6 +65,18 @@ def _tmdb_get(path: str, params: dict | None = None) -> dict:
             return response.json()
         except (requests.ConnectionError, requests.Timeout) as exc:
             last_exc = exc
+        except requests.HTTPError as exc:
+            last_exc = exc
+            # Retrying a 4xx (other than rate-limiting) would just fail the same way again.
+            status = exc.response.status_code if exc.response is not None else None
+            if status is not None and 400 <= status < 500 and status != 429:
+                raise
+        if attempt < _MAX_ATTEMPTS - 1:
+            # TMDB intermittently resets the TLS connection from this host — measured at
+            # roughly a 50% per-attempt failure rate, but each failure surfaces in
+            # ~150-200ms, so several quick, lightly-backed-off retries clear it almost
+            # every time without meaningfully adding to request latency.
+            time.sleep(min(0.25 * (attempt + 1), 1.5))
     raise last_exc
 
 
