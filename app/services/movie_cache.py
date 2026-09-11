@@ -112,14 +112,30 @@ def get_movie(movie_id: int, segments: tuple[str, ...] = ALL_SEGMENTS) -> dict:
     existing = supabase.table("movies").select("*").eq("id", movie_id).limit(1).execute()
     row = existing.data[0] if existing.data else None
 
-    update: dict = {"id": movie_id, "last_viewed_at": datetime.now(timezone.utc).isoformat()}
     stale = _stale_segments(row, segments)
+    if row is None and "core" not in stale:
+        # First-ever insert must always populate the NOT NULL columns (title
+        # etc.), which only the core segment provides — guarantee it's fetched
+        # even if the caller only asked for e.g. ("providers",).
+        stale = ["core", *stale]
+
+    update: dict = {"id": movie_id, "last_viewed_at": datetime.now(timezone.utc).isoformat()}
     if stale:
         tmdb_data = tmdb.fetch_movie_segments(movie_id, set(stale))
         for seg in stale:
             update.update(_extract_segment_fields(seg, tmdb_data))
 
-    supabase.table("movies").upsert(update, on_conflict="id").execute()
+    if row is None:
+        # Insert path: upsert needs the NOT NULL columns present (guaranteed above).
+        supabase.table("movies").upsert(update, on_conflict="id").execute()
+    else:
+        # Update path: a plain UPDATE only touches the columns we pass, so a
+        # partial payload (e.g. just last_viewed_at on an all-fresh row) can't
+        # trip NOT NULL constraints on columns we're not even setting — unlike
+        # upsert(), which validates a full candidate row before honoring the
+        # ON CONFLICT clause.
+        supabase.table("movies").update(update).eq("id", movie_id).execute()
+
     # A genuinely invalid movie_id already raises inside fetch_movie_segments
     # (TMDB 404 -> requests.raise_for_status()) before we get here, so by this
     # point `row` always represents a real movie.
