@@ -1,4 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 
 from flask import Blueprint, jsonify, request
 
@@ -7,7 +8,7 @@ from app.utils.auth import require_auth
 from app.utils.sanitize import sanitize_text
 from app.utils.social import filter_friend_ids, filter_owned_group_ids
 from app.services.supabase_client import get_supabase
-from app.services import tmdb as tmdb_service
+from app.services import movie_cache
 from app.utils.errors import server_error
 
 reviews_bp = Blueprint("reviews", __name__)
@@ -33,30 +34,24 @@ def _enrich_movies(movies: list[dict], supabase) -> list[dict]:
 
     def _fetch_one(movie_id: int, movie: dict) -> tuple[int, dict]:
         try:
-            details = tmdb_service.get_movie_basic(movie_id)
+            fresh = movie_cache.get_movie(movie_id, segments=("core",))
             update: dict = {}
-            if movie.get("genre_ids") is None and details.get("genres"):
-                update["genre_ids"] = [g["id"] for g in details["genres"]]
-            if movie.get("vote_average") is None and details.get("vote_average") is not None:
-                update["vote_average"] = details["vote_average"]
+            if movie.get("genre_ids") is None and fresh.get("genre_ids"):
+                update["genre_ids"] = fresh["genre_ids"]
+            if movie.get("vote_average") is None and fresh.get("vote_average") is not None:
+                update["vote_average"] = fresh["vote_average"]
             return movie_id, update
         except Exception:
             return movie_id, {}
 
-    db_updates: list[dict] = []
+    # movie_cache.get_movie already persists the core segment to the DB, so we
+    # only need to merge the fetched values into the in-memory response here.
     with ThreadPoolExecutor(max_workers=min(len(to_enrich), 10)) as executor:
         futures = {executor.submit(_fetch_one, mid, m): mid for mid, m in to_enrich.items()}
         for future in as_completed(futures):
             mid, update = future.result()
             if update:
                 movie_map[mid].update(update)
-                db_updates.append({"id": mid, **update})
-
-    if db_updates:
-        try:
-            supabase.table("movies").upsert(db_updates, on_conflict="id").execute()
-        except Exception:
-            pass
 
     return [movie_map.get(m["id"], m) if m else m for m in movies]
 
@@ -80,21 +75,24 @@ def create_review():
     if rating is None or not (1 <= float(rating) <= 5):
         return jsonify({"error": "Rating must be between 1 and 5"}), 400
 
-    # Upsert the movie stub so the FK constraint is satisfied
-    movie_data = {
+    # Lightweight fallback stub, used only if the authoritative TMDB-backed
+    # fetch below fails (e.g. TMDB unreachable) — keeps review creation from
+    # hard-failing just because TMDB is down.
+    fallback_movie_data = {
         "id": movie_id,
         "title": sanitize_text(body.get("title", "")),
         "poster_path": body.get("poster_path"),
         "release_date": body.get("release_date"),
+        "last_viewed_at": datetime.now(timezone.utc).isoformat(),
     }
     raw_genre_ids = body.get("genre_ids") or []
     genre_ids_list = [int(g) for g in raw_genre_ids if isinstance(g, (int, float))] if isinstance(raw_genre_ids, list) else []
     if genre_ids_list:
-        movie_data["genre_ids"] = genre_ids_list
+        fallback_movie_data["genre_ids"] = genre_ids_list
     vote_average = body.get("vote_average")
     if vote_average is not None:
         try:
-            movie_data["vote_average"] = float(vote_average)
+            fallback_movie_data["vote_average"] = float(vote_average)
         except (ValueError, TypeError):
             pass
 
@@ -109,9 +107,19 @@ def create_review():
 
     supabase = get_supabase()
 
+    # Route through the segmented read-through cache so the movie record ends
+    # up fully persisted (not just the FK-satisfying stub) on the first touch.
+    # Falls back to the client-supplied stub if TMDB is unreachable so review
+    # creation never hard-fails on a TMDB outage.
     try:
-        supabase.table("movies").upsert(movie_data, on_conflict="id").execute()
+        movie_cache.get_movie(movie_id, segments=("core",))
+    except Exception:
+        try:
+            supabase.table("movies").upsert(fallback_movie_data, on_conflict="id").execute()
+        except Exception:
+            pass
 
+    try:
         review_payload = {
             "user_id": str(user.id),
             "movie_id": movie_id,

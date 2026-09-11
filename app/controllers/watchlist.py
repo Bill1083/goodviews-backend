@@ -1,10 +1,12 @@
+from datetime import datetime, timezone
+
 from flask import Blueprint, jsonify, request
 
 from app import limiter
 from app.utils.auth import require_auth
 from app.utils.sanitize import sanitize_text
 from app.services.supabase_client import get_supabase
-from app.services import tmdb as tmdb_service
+from app.services import movie_cache
 from app.utils.errors import server_error
 
 watchlist_bp = Blueprint("watchlist", __name__)
@@ -13,7 +15,6 @@ watchlist_bp = Blueprint("watchlist", __name__)
 def _enrich_movies(movies: list[dict], supabase) -> list[dict]:
     """Backfill genre_ids and vote_average for movies missing those fields, using cached TMDB data."""
     enriched = []
-    db_updates = []
     for movie in movies:
         if movie is None:
             enriched.append(movie)
@@ -22,23 +23,19 @@ def _enrich_movies(movies: list[dict], supabase) -> list[dict]:
         needs_vote = movie.get("vote_average") is None
         if needs_genre or needs_vote:
             try:
-                details = tmdb_service.get_movie_details(movie["id"])
+                # movie_cache.get_movie already persists the core segment to
+                # the DB; only merge the fetched values into the response here.
+                fresh = movie_cache.get_movie(movie["id"], segments=("core",))
                 update: dict = {}
-                if needs_genre and details.get("genres"):
-                    update["genre_ids"] = [g["id"] for g in details["genres"]]
-                if needs_vote and details.get("vote_average") is not None:
-                    update["vote_average"] = details["vote_average"]
+                if needs_genre and fresh.get("genre_ids"):
+                    update["genre_ids"] = fresh["genre_ids"]
+                if needs_vote and fresh.get("vote_average") is not None:
+                    update["vote_average"] = fresh["vote_average"]
                 if update:
-                    db_updates.append({"id": movie["id"], **update})
                     movie = {**movie, **update}
             except Exception:
                 pass
         enriched.append(movie)
-    if db_updates:
-        try:
-            supabase.table("movies").upsert(db_updates, on_conflict="id").execute()
-        except Exception:
-            pass
     return enriched
 
 
@@ -83,27 +80,40 @@ def add_to_watchlist():
     if not movie_id or not isinstance(movie_id, int):
         return jsonify({"error": "Valid movie_id (integer) is required"}), 400
 
-    movie_data = {
+    # Lightweight fallback stub, used only if the authoritative TMDB-backed
+    # fetch below fails (e.g. TMDB unreachable) — keeps adding to the
+    # watchlist from hard-failing just because TMDB is down.
+    fallback_movie_data = {
         "id": movie_id,
         "title": sanitize_text(body.get("title", "")),
         "poster_path": body.get("poster_path"),
         "release_date": body.get("release_date"),
+        "last_viewed_at": datetime.now(timezone.utc).isoformat(),
     }
     raw_genre_ids = body.get("genre_ids") or []
     genre_ids_list = [int(g) for g in raw_genre_ids if isinstance(g, (int, float))] if isinstance(raw_genre_ids, list) else []
     if genre_ids_list:
-        movie_data["genre_ids"] = genre_ids_list
+        fallback_movie_data["genre_ids"] = genre_ids_list
     vote_average = body.get("vote_average")
     if vote_average is not None:
         try:
-            movie_data["vote_average"] = float(vote_average)
+            fallback_movie_data["vote_average"] = float(vote_average)
         except (ValueError, TypeError):
             pass
 
     supabase = get_supabase()
-    try:
-        supabase.table("movies").upsert(movie_data, on_conflict="id").execute()
 
+    # Route through the segmented read-through cache so the movie record ends
+    # up fully persisted (not just the FK-satisfying stub) on the first touch.
+    try:
+        movie_cache.get_movie(movie_id, segments=("core",))
+    except Exception:
+        try:
+            supabase.table("movies").upsert(fallback_movie_data, on_conflict="id").execute()
+        except Exception:
+            pass
+
+    try:
         existing = (
             supabase.table("watchlist")
             .select("movie_id")
