@@ -3,7 +3,7 @@ from flask import Blueprint, jsonify, request
 from app import limiter
 from app.services.supabase_client import get_supabase
 from app.services import trusted_devices
-from app.utils.auth import require_auth
+from app.utils.auth import require_auth, require_auth_basic
 from app.utils.errors import server_error
 
 auth_bp = Blueprint("auth", __name__)
@@ -68,11 +68,13 @@ def create_trusted_device():
 
 
 @auth_bp.post("/trusted-devices/verify")
-@require_auth
+@require_auth_basic
 @limiter.limit("30 per minute")
 def verify_trusted_device():
-    """Called on login (before showing the MFA challenge) with whatever
-    trusted-device token the client has stored for this account, if any."""
+    """Called on login (before showing the MFA challenge, so still only
+    AAL1) with whatever trusted-device token the client has stored for this
+    account, if any — must stay on require_auth_basic, not require_auth,
+    since require_auth would itself reject an AAL1 caller before this ever runs."""
     body = request.get_json(silent=True) or {}
     token = body.get("token", "")
     if not token:
