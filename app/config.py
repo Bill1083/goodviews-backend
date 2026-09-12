@@ -12,6 +12,9 @@ class Config:
         origin.strip()
         for origin in os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",")
     ]
+
+    # "Remember this device" MFA opt-out window
+    TRUSTED_DEVICE_TTL_DAYS = int(os.getenv("TRUSTED_DEVICE_TTL_DAYS", 30))
     # Rate limiting
     RATELIMIT_DEFAULT = "200 per day;50 per hour"
     RATELIMIT_STORAGE_URI = os.getenv("REDIS_URL", "memory://")
