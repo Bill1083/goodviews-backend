@@ -182,6 +182,7 @@ def _reason_for(provenance: str, top_contributor: tuple[str, str] | None) -> str
 
 
 def _compute(user_id: str, supabase) -> list[dict]:
+    app = current_app._get_current_object()
     my_reviews = (
         supabase.table("reviews").select("movie_id, rating, rewatch_count").eq("user_id", user_id).execute().data
     )
@@ -278,44 +279,56 @@ def _compute(user_id: str, supabase) -> list[dict]:
                 "person_ids": [],
             }
 
+    # Each of these is its own TMDB call (with its own internal retry/backoff
+    # on connection resets) — running them one at a time could add up to a
+    # minute-plus of sequential wait under any TMDB flakiness. Fan them out
+    # in parallel instead so total latency is ~the slowest single call per
+    # batch, not the sum of all of them.
     top_positive = sorted(positive_seeds, key=lambda r: (r["rating"], r.get("rewatch_count") or 0), reverse=True)[:8]
+    tasks: list[tuple[str, int, str]] = []
     for r in top_positive:
         info = seed_info.get(r["movie_id"])
         title = info["title"] if info and info.get("title") else "a movie you rated"
-        try:
-            data = tmdb.get_movie_recommendations(r["movie_id"])
-            if len(data.get("results", [])) < 5:
-                data = tmdb.get_similar_movies(r["movie_id"])
-        except Exception:
-            continue
-        _add(data.get("results", []), "seed_rec", ("seed", title))
-
+        tasks.append(("seed_rec", r["movie_id"], title))
     for row in fav_actors[:5]:
-        try:
-            data = tmdb.discover_movies(
-                {"with_cast": row["actor_id"], "sort_by": "vote_average.desc", "vote_count.gte": 100}
-            )
-        except Exception:
-            continue
-        _add(data.get("results", []), "favourite", ("person", row["actor_name"]))
-
+        tasks.append(("favourite_actor", row["actor_id"], row["actor_name"]))
     for row in fav_directors[:5]:
-        try:
-            data = tmdb.discover_movies(
-                {"with_crew": row["director_id"], "sort_by": "vote_average.desc", "vote_count.gte": 100}
-            )
-        except Exception:
-            continue
-        _add(data.get("results", []), "favourite", ("person", row["director_name"]))
-
+        tasks.append(("favourite_director", row["director_id"], row["director_name"]))
     for r in diversity_seeds[:2]:
         info = seed_info.get(r["movie_id"])
         title = info["title"] if info and info.get("title") else "a movie you rated"
-        try:
-            data = tmdb.get_movie_recommendations(r["movie_id"])
-        except Exception:
-            continue
-        _add(data.get("results", []), "diversity", ("seed", title))
+        tasks.append(("diversity", r["movie_id"], title))
+
+    def _run_task(task: tuple[str, int, str]):
+        kind, key, label = task
+        with app.app_context():
+            try:
+                if kind in ("seed_rec", "diversity"):
+                    data = tmdb.get_movie_recommendations(key)
+                    if kind == "seed_rec" and len(data.get("results", [])) < 5:
+                        data = tmdb.get_similar_movies(key)
+                elif kind == "favourite_actor":
+                    data = tmdb.discover_movies(
+                        {"with_cast": key, "sort_by": "vote_average.desc", "vote_count.gte": 100}
+                    )
+                else:
+                    data = tmdb.discover_movies(
+                        {"with_crew": key, "sort_by": "vote_average.desc", "vote_count.gte": 100}
+                    )
+            except Exception:
+                data = {}
+        provenance = "favourite" if kind.startswith("favourite") else kind
+        contributor_type = "seed" if kind in ("seed_rec", "diversity") else "person"
+        return provenance, (contributor_type, label), data.get("results", [])
+
+    if tasks:
+        # executor.map preserves task order in its output (unlike as_completed),
+        # so applying results in this order keeps _add's first-writer-wins
+        # dedup priority the same as the old sequential version: seed_rec,
+        # then favourites, then diversity.
+        with ThreadPoolExecutor(max_workers=min(len(tasks), 10)) as executor:
+            for provenance, top_contributor, results in executor.map(_run_task, tasks):
+                _add(results, provenance, top_contributor)
 
     # ── Friend signal: a friend's 4-5★ review boosts a movie; a friend's
     #    1-2★ review vetoes it outright, regardless of every other signal. ──
