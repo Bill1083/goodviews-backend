@@ -2,6 +2,7 @@ from flask import Flask
 from flask_cors import CORS
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 from app.config import Config
 
@@ -11,6 +12,14 @@ limiter = Limiter(key_func=get_remote_address)
 def create_app() -> Flask:
     app = Flask(__name__)
     app.config.from_object(Config)
+
+    # nginx sits in front of every request (see the staging/prod nginx confs),
+    # so request.remote_addr is otherwise always nginx's own address — which
+    # made every rate limit a single bucket shared by every visitor to the
+    # site, not per-visitor. Trust exactly one proxy hop's X-Forwarded-For/
+    # X-Forwarded-Proto so get_remote_address (used by @limiter.limit
+    # everywhere) sees the real client IP.
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1)
 
     # CORS — only allow configured origins
     CORS(app, resources={r"/api/*": {"origins": app.config["CORS_ORIGINS"]}})
