@@ -47,4 +47,15 @@ def create_app() -> Flask:
     def health():
         return {"status": "ok"}
 
+    @app.cli.command("prune-movies")
+    def prune_movies_command():
+        """Delete movie rows not viewed in MOVIE_PRUNE_AFTER_DAYS days that
+        aren't referenced by any watchlist/review/notification. Intended to be
+        run on a schedule (e.g. a Render Cron Job or system cron) — not called
+        automatically by the app itself."""
+        from app.services import movie_cache
+
+        deleted = movie_cache.prune_unwatched_movies()
+        print(f"Pruned {deleted} movie(s).")
+
     return app

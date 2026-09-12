@@ -37,12 +37,12 @@ def _cache_get(key: str) -> Any | None:
         return None
 
 
-def _cache_set(key: str, value: Any) -> None:
+def _cache_set(key: str, value: Any, ttl: int | None = None) -> None:
     r = _get_redis()
     if r is None:
         return
     try:
-        r.setex(key, CACHE_TTL_SECONDS, json.dumps(value))
+        r.setex(key, ttl or CACHE_TTL_SECONDS, json.dumps(value))
     except Exception:
         pass
 
@@ -77,48 +77,36 @@ def search_movies(query: str, page: int = 1) -> dict:
     if cached:
         return _sort_by_popularity(cached)
     data = _tmdb_get("/search/movie", {"query": query, "page": page})
-    _cache_set(cache_key, data)
+    _cache_set(cache_key, data, ttl=current_app.config["SEARCH_CACHE_TTL_SECONDS"])
     return _sort_by_popularity(data)
 
 
-def get_movie_details(movie_id: int) -> dict:
-    # Cache key includes "providers" so we don't serve a stale payload (missing
-    # watch/providers) that was cached before that field was added to the request.
-    cache_key = f"tmdb:movie:{movie_id}:with_credits_providers"
-    cached = _cache_get(cache_key)
-    if cached:
-        return cached
-    data = _tmdb_get(f"/movie/{movie_id}", {"append_to_response": "credits,watch/providers"})
-    _cache_set(cache_key, data)
-    return data
+SEGMENT_TOKENS = {"core": "credits", "media": "videos", "providers": "watch/providers"}
+
+
+def fetch_movie_segments(movie_id: int, segments: set[str]) -> dict:
+    """Fetch exactly the requested segments for a movie in ONE TMDB call via
+    append_to_response. Always hits TMDB live — no Redis caching here; freshness
+    for movie details is governed by Postgres timestamp columns, one layer up
+    in app.services.movie_cache."""
+    tokens = [SEGMENT_TOKENS[s] for s in segments if s in SEGMENT_TOKENS]
+    params = {"append_to_response": ",".join(tokens)} if tokens else None
+    return _tmdb_get(f"/movie/{movie_id}", params)
 
 
 def get_movie_images(movie_id: int) -> dict:
     """Poster/backdrop/logo art for a movie — kept as its own call (not appended to
-    get_movie_details) so the AvatarPicker's poster grid doesn't balloon the payload
-    of the main movie-details endpoint that every other movie view also relies on."""
+    the details fetch) so the AvatarPicker's poster grid doesn't balloon the payload
+    of the main movie-details endpoint that every other movie view also relies on.
+    Cached in Redis (not Postgres — this is an unbounded gallery array, not a single
+    scalar/small-jsonb field) using the same freshness window as the media segment."""
     cache_key = f"tmdb:movie:{movie_id}:images"
     cached = _cache_get(cache_key)
     if cached:
         return cached
     data = _tmdb_get(f"/movie/{movie_id}/images")
-    _cache_set(cache_key, data)
-    return data
-
-
-def get_movie_basic(movie_id: int) -> dict:
-    """Lightweight movie fetch (no credits) used only for genre/rating enrichment.
-    Reuses the full-details cache when already available to avoid a redundant call."""
-    full_cache_key = f"tmdb:movie:{movie_id}:with_credits_providers"
-    cached_full = _cache_get(full_cache_key)
-    if cached_full:
-        return cached_full
-    cache_key = f"tmdb:movie:{movie_id}:basic"
-    cached = _cache_get(cache_key)
-    if cached:
-        return cached
-    data = _tmdb_get(f"/movie/{movie_id}")
-    _cache_set(cache_key, data)
+    ttl = current_app.config["MOVIE_MEDIA_TTL_DAYS"] * 86400
+    _cache_set(cache_key, data, ttl=ttl)
     return data
 
 

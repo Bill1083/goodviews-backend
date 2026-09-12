@@ -5,6 +5,7 @@ from app.utils.auth import require_auth
 from app.utils.sanitize import sanitize_text
 from app.utils.social import filter_friend_ids, filter_owned_group_ids
 from app.services import tmdb
+from app.services import movie_cache
 from app.services.supabase_client import get_supabase
 from app.utils.errors import server_error
 
@@ -62,7 +63,7 @@ def top_rated():
 @limiter.limit("60 per minute")
 def details(movie_id: int):
     try:
-        data = tmdb.get_movie_details(movie_id)
+        data = movie_cache.get_movie(movie_id)
         return jsonify(data)
     except Exception as exc:
         return server_error("Failed to fetch movie details", exc, 502)
@@ -72,10 +73,23 @@ def details(movie_id: int):
 @limiter.limit("60 per minute")
 def images(movie_id: int):
     try:
-        data = tmdb.get_movie_images(movie_id)
+        data = movie_cache.get_movie_images(movie_id)
         return jsonify(data)
     except Exception as exc:
         return server_error("Failed to fetch movie images", exc, 502)
+
+
+@movies_bp.post("/<int:movie_id>/refresh")
+@require_auth
+@limiter.limit("5 per hour")
+def refresh_movie(movie_id: int):
+    """User-triggered force refresh: bypasses all TTL/cache checks and
+    overwrites the stored record with fresh TMDB data."""
+    try:
+        data = movie_cache.force_refresh_movie(movie_id)
+        return jsonify(data)
+    except Exception as exc:
+        return server_error("Failed to refresh movie", exc, 502)
 
 
 @movies_bp.post("/recommend")
