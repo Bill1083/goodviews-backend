@@ -12,8 +12,20 @@ def create_app() -> Flask:
     app = Flask(__name__)
     app.config.from_object(Config)
 
-    # CORS — only allow configured origins
-    CORS(app, resources={r"/api/*": {"origins": app.config["CORS_ORIGINS"]}})
+    # CORS — only allow configured origins. allow_headers must be listed
+    # explicitly (rather than relying on flask-cors' default) since prod
+    # serves the API from a separate subdomain (api.goodviews.online) from
+    # the frontend (goodviews.online) — a genuinely cross-origin request,
+    # unlike staging where nginx proxies both under one origin. Without an
+    # explicit allow_headers, the browser's CORS preflight rejected the
+    # custom X-Trusted-Device-Token header (sent on every request once a
+    # device is remembered — see apiClient.ts), breaking every API call for
+    # anyone with a remembered device, not just the trusted-device ones.
+    CORS(
+        app,
+        resources={r"/api/*": {"origins": app.config["CORS_ORIGINS"]}},
+        allow_headers=["Authorization", "Content-Type", "X-Trusted-Device-Token"],
+    )
 
     # Rate limiter — backed by Redis when available
     limiter.init_app(app)
@@ -57,5 +69,17 @@ def create_app() -> Flask:
 
         deleted = movie_cache.prune_unwatched_movies()
         print(f"Pruned {deleted} movie(s).")
+
+    @app.cli.command("refresh-stale-movies")
+    def refresh_stale_movies_command():
+        """Force-refreshes any movie row TMDB data older than
+        MOVIE_MAX_CACHE_AGE_DAYS (default 150) from TMDB — required for
+        compliance with TMDB's API Terms of Use, which prohibit caching their
+        data for longer than 6 months. Run on the same kind of schedule as
+        prune-movies (e.g. a Render Cron Job or system cron), at least monthly."""
+        from app.services import movie_cache
+
+        refreshed = movie_cache.refresh_stale_movies()
+        print(f"Refreshed {refreshed} stale movie(s).")
 
     return app

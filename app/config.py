@@ -20,6 +20,13 @@ class Config:
     # Prune movies not viewed in this many days (and not referenced by any
     # watchlist/review/notification) to keep the DB from growing forever.
     MOVIE_PRUNE_AFTER_DAYS = int(os.getenv("MOVIE_PRUNE_AFTER_DAYS", 90))
+
+    # TMDB's API Terms of Use (Section 1.C) prohibit caching TMDB-sourced
+    # information for longer than 6 months. A movie referenced by a review or
+    # watchlist item is never pruned, so without this it could sit unrefreshed
+    # indefinitely if nobody ever revisits it. Set comfortably under 6 months
+    # (~182 days) so a job that only runs monthly still stays compliant.
+    MOVIE_MAX_CACHE_AGE_DAYS = int(os.getenv("MOVIE_MAX_CACHE_AGE_DAYS", 150))
     CORS_ORIGINS = [
         origin.strip()
         for origin in os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",")

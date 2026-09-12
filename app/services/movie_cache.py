@@ -1,4 +1,5 @@
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -190,6 +191,55 @@ def prune_unwatched_movies(days: int | None = None) -> int:
     supabase.table("movies").delete().in_("id", to_delete).execute()
     logger.info("Pruned %d unwatched movie(s) older than %s days", len(to_delete), days or current_app.config["MOVIE_PRUNE_AFTER_DAYS"])
     return len(to_delete)
+
+
+def refresh_stale_movies(max_age_days: int | None = None) -> int:
+    """TMDB's API Terms of Use (Section 1.C) prohibit caching TMDB-sourced
+    information for longer than 6 months. A movie referenced by a review or
+    watchlist item is never pruned by prune_unwatched_movies, so without this
+    it could sit unrefreshed indefinitely if nobody ever revisits it. Finds
+    every row past the cutoff (or that never got a real core fetch at all —
+    e.g. a fallback stub inserted while TMDB was briefly down) and
+    force-refreshes it. Intended to run on the same kind of schedule as
+    prune-movies (see app/__init__.py's CLI commands) — monthly is
+    comfortably inside the default 150-day margin. Returns the number of
+    rows successfully refreshed."""
+    cutoff = datetime.now(timezone.utc) - timedelta(
+        days=max_age_days or current_app.config["MOVIE_MAX_CACHE_AGE_DAYS"]
+    )
+    supabase = get_supabase()
+
+    stale_rows = (
+        supabase.table("movies")
+        .select("id")
+        .or_(f"core_updated_at.is.null,core_updated_at.lt.{cutoff.isoformat()}")
+        .execute()
+    )
+    stale_ids = [m["id"] for m in stale_rows.data]
+    if not stale_ids:
+        return 0
+
+    # Each worker thread needs its own pushed Flask app context —
+    # force_refresh_movie relies on current_app (TMDB API key), which a
+    # ThreadPoolExecutor worker doesn't inherit by default.
+    app = current_app._get_current_object()
+
+    def _refresh_one(mid: int) -> bool:
+        with app.app_context():
+            try:
+                force_refresh_movie(mid)
+                return True
+            except Exception:
+                logger.exception("Failed to refresh stale movie %s", mid)
+                return False
+
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        refreshed = sum(1 for ok in executor.map(_refresh_one, stale_ids) if ok)
+    logger.info(
+        "Refreshed %d/%d stale movie(s) older than %s days",
+        refreshed, len(stale_ids), max_age_days or current_app.config["MOVIE_MAX_CACHE_AGE_DAYS"],
+    )
+    return refreshed
 
 
 def get_movie_images(movie_id: int) -> dict:
