@@ -17,6 +17,14 @@ MAX_PICKS_PER_PERSON = 2
 DIVERSITY_SLOTS = 3  # reserved for 3-star-seeded ("diversity") picks
 MAX_CANDIDATES_TO_ENRICH = 120
 
+# How much of the feed a single rated movie is allowed to seed, scaling with
+# how many movies the user has actually rated — one 5★ review shouldn't
+# dominate the whole feed. At 10+ movies rated ≥4★ (or an equivalent mix
+# with 3★s at half weight), review-based signal can fill the entire feed;
+# with fewer, the rest is topped up with generic popular-movie backfill.
+REVIEW_SHARE_PER_POSITIVE = 0.10
+REVIEW_SHARE_PER_DIVERSITY = 0.05
+
 # Positive weight by rating bucket (5 > 4 > 3-diversity); negative weight
 # (magnitude, applied as a penalty) by rating bucket (1 > 2).
 _POSITIVE_WEIGHT = {5: 2.0, 4: 1.0, 3: 0.4}
@@ -298,6 +306,12 @@ def _compute(user_id: str, supabase) -> list[dict]:
         info = seed_info.get(r["movie_id"])
         title = info["title"] if info and info.get("title") else "a movie you rated"
         tasks.append(("diversity", r["movie_id"], title))
+    # Onboarding genre picks are an explicit preference signal like
+    # favourites, not tied to review count — a user who only did step 1
+    # still gets some personalization instead of pure backfill.
+    for gid in onboarding_genre_ids[:3]:
+        genre_name = movie_cache.GENRE_MAP.get(gid, "that genre")
+        tasks.append(("favourite_genre", gid, genre_name))
 
     def _run_task(task: tuple[str, int, str]):
         kind, key, label = task
@@ -311,9 +325,13 @@ def _compute(user_id: str, supabase) -> list[dict]:
                     data = tmdb.discover_movies(
                         {"with_cast": key, "sort_by": "vote_average.desc", "vote_count.gte": 100}
                     )
-                else:
+                elif kind == "favourite_director":
                     data = tmdb.discover_movies(
                         {"with_crew": key, "sort_by": "vote_average.desc", "vote_count.gte": 100}
+                    )
+                else:
+                    data = tmdb.discover_movies(
+                        {"with_genres": key, "sort_by": "popularity.desc", "vote_count.gte": 100}
                     )
             except Exception:
                 data = {}
@@ -437,12 +455,17 @@ def _compute(user_id: str, supabase) -> list[dict]:
     genre_counts: dict[int, int] = {}
     person_counts: dict[int, int] = {}
     friend_count = 0
+    review_based_count = 0
     max_friend = round(FEED_SIZE * MAX_FRIEND_SHARE)
     max_per_genre = max(1, round(FEED_SIZE * MAX_GENRE_SHARE))
+    review_share = min(1.0, REVIEW_SHARE_PER_POSITIVE * len(positive_seeds) + REVIEW_SHARE_PER_DIVERSITY * len(diversity_seeds))
+    max_review_based = round(FEED_SIZE * review_share)
 
     def _try_add(mid: int, c: dict) -> bool:
-        nonlocal friend_count
+        nonlocal friend_count, review_based_count
         if c["provenance"] == "friend" and friend_count >= max_friend:
+            return False
+        if c["provenance"] in ("seed_rec", "diversity") and review_based_count >= max_review_based:
             return False
         if any(person_counts.get(pid, 0) >= MAX_PICKS_PER_PERSON for pid in c["person_ids"]):
             return False
@@ -455,6 +478,8 @@ def _compute(user_id: str, supabase) -> list[dict]:
             genre_counts[gid] = genre_counts.get(gid, 0) + 1
         if c["provenance"] == "friend":
             friend_count += 1
+        if c["provenance"] in ("seed_rec", "diversity"):
+            review_based_count += 1
         return True
 
     main_pool = [t for t in scored if t[2]["provenance"] != "diversity"]
@@ -478,14 +503,7 @@ def _compute(user_id: str, supabase) -> list[dict]:
             if mid not in chosen_ids:
                 _try_add(mid, c)
 
-    # ── Backfill if too few candidates survived scoring/diversification ────
-    if len(selected) < 10:
-        chosen_ids = {mid for mid, _ in selected}
-        backfill = _backfill_items(excluded_ids | chosen_ids, FEED_SIZE - len(selected), supabase)
-        items = [{"movie_id": mid, "reason": _reason_for(c["provenance"], c["top_contributor"])} for mid, c in selected]
-        return items + backfill
-
-    # ── Persist stubs for anything not already cached, then return ─────────
+    # ── Persist stubs for anything not already cached ──────────────────────
     stubs = [_upsert_movie_stub({"id": mid, **c}) for mid, c in selected if c.get("title")]
     if stubs:
         try:
@@ -493,4 +511,14 @@ def _compute(user_id: str, supabase) -> list[dict]:
         except Exception:
             logger.exception("Failed to upsert recommendation movie stubs")
 
-    return [{"movie_id": mid, "reason": _reason_for(c["provenance"], c["top_contributor"])} for mid, c in selected]
+    items = [{"movie_id": mid, "reason": _reason_for(c["provenance"], c["top_contributor"])} for mid, c in selected]
+
+    # Top up to FEED_SIZE with generic popular-movie backfill — always, not
+    # just when things are sparse, since the review-based proportional cap
+    # above deliberately leaves this gap for anyone without much review
+    # history yet (including a fully skipped onboarding).
+    if len(items) < FEED_SIZE:
+        chosen_ids = {mid for mid, _ in selected}
+        items += _backfill_items(excluded_ids | chosen_ids, FEED_SIZE - len(items), supabase)
+
+    return items
