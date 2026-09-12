@@ -7,6 +7,7 @@ from app import limiter
 from app.utils.auth import require_auth
 from app.utils.sanitize import sanitize_str
 from app.services.supabase_client import get_supabase
+from app.services.movie_cache import GENRE_MAP
 from app.utils.errors import server_error
 
 profile_bp = Blueprint("profile", __name__)
@@ -27,7 +28,7 @@ def get_profile():
     try:
         result = (
             supabase.table("profiles")
-            .select("id, username, bio, profile_visibility, avatar_color, avatar_url, avatar_focal_y, avatar_zoom, hide_recent_movies, mute_recommendations, mute_friend_requests")
+            .select("id, username, bio, profile_visibility, avatar_color, avatar_url, avatar_focal_y, avatar_zoom, hide_recent_movies, mute_recommendations, mute_friend_requests, has_onboarded, onboarding_genre_ids")
             .eq("id", str(user.id))
             .single()
             .execute()
@@ -112,6 +113,21 @@ def update_profile():
 
     if "mute_friend_requests" in body:
         updates["mute_friend_requests"] = bool(body["mute_friend_requests"])
+
+    if "has_onboarded" in body:
+        updates["has_onboarded"] = bool(body["has_onboarded"])
+
+    if "onboarding_genre_ids" in body:
+        raw_genre_ids = body["onboarding_genre_ids"]
+        if not isinstance(raw_genre_ids, list):
+            return jsonify({"error": "onboarding_genre_ids must be a list"}), 400
+        try:
+            genre_ids = [int(g) for g in raw_genre_ids]
+        except (TypeError, ValueError):
+            return jsonify({"error": "onboarding_genre_ids must be integers"}), 400
+        if any(g not in GENRE_MAP for g in genre_ids):
+            return jsonify({"error": "Invalid genre id in onboarding_genre_ids"}), 400
+        updates["onboarding_genre_ids"] = genre_ids
 
     if not updates:
         return jsonify({"error": "No valid fields provided"}), 400

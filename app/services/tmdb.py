@@ -122,8 +122,8 @@ def get_trending_movies(page: int = 1) -> dict:
 
 
 def get_top_rated_movies(page: int = 1) -> dict:
-    """All-time top-rated movies, used as a placeholder feed until personalized
-    'For You' recommendations exist."""
+    """All-time top-rated movies — used both as its own Discover tab and as
+    the cold-start/backfill source for 'For You' (see app.services.recommendations)."""
     cache_key = f"tmdb:top_rated:{page}"
     cached = _cache_get(cache_key)
     if cached:
@@ -131,6 +131,27 @@ def get_top_rated_movies(page: int = 1) -> dict:
     data = _tmdb_get("/movie/top_rated", {"page": page})
     _cache_set(cache_key, data)
     return data
+
+
+def get_movie_recommendations(movie_id: int, page: int = 1) -> dict:
+    """TMDB's own "people who liked this also liked" list for one movie —
+    the primary content-based candidate source for 'For You', seeded from a
+    user's own highly-rated movies. Not Redis-cached: seed-specific, low
+    repeat-hit-rate, same reasoning as fetch_movie_segments."""
+    return _tmdb_get(f"/movie/{movie_id}/recommendations", {"page": page})
+
+
+def get_similar_movies(movie_id: int, page: int = 1) -> dict:
+    """Fallback candidate source when a seed's /recommendations list is thin
+    — TMDB's genre/keyword-similarity list rather than its collaborative one."""
+    return _tmdb_get(f"/movie/{movie_id}/similar", {"page": page})
+
+
+def discover_movies(params: dict) -> dict:
+    """Thin passthrough to TMDB's /discover/movie — used to generate
+    candidates from a favourite actor/director (with_cast/with_crew) rather
+    than from a specific seed movie."""
+    return _tmdb_get("/discover/movie", params)
 
 
 def search_people(query: str, page: int = 1) -> dict:

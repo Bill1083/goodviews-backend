@@ -30,6 +30,7 @@ def create_app() -> Flask:
     from app.controllers.people import people_bp
     from app.controllers.favourites import favourites_bp
     from app.controllers.auth import auth_bp
+    from app.controllers.onboarding import onboarding_bp
 
     app.register_blueprint(movies_bp, url_prefix="/api/movies")
     app.register_blueprint(reviews_bp, url_prefix="/api/reviews")
@@ -42,6 +43,7 @@ def create_app() -> Flask:
     app.register_blueprint(people_bp, url_prefix="/api/people")
     app.register_blueprint(favourites_bp, url_prefix="/api/favourites")
     app.register_blueprint(auth_bp, url_prefix="/api/auth")
+    app.register_blueprint(onboarding_bp, url_prefix="/api/onboarding")
 
     @app.get("/api/health")
     def health():
