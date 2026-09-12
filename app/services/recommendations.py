@@ -77,7 +77,7 @@ def _hydrate(items: list[dict], supabase) -> dict:
     reason_by_id = {it["movie_id"]: it["reason"] for it in items}
     result = (
         supabase.table("movies")
-        .select("id, title, poster_path, release_date, vote_average, genre_ids")
+        .select("id, title, poster_path, backdrop_path, release_date, vote_average, genre_ids")
         .in_("id", list(reason_by_id.keys()))
         .execute()
     )
@@ -118,6 +118,8 @@ def _fetch_credits(movie_ids: list[int]) -> dict[int, dict]:
         director_ids = [c["id"] for c in (credits.get("crew") or []) if c.get("job") == "Director" and c.get("id")]
         return mid, {
             "title": data.get("title"),
+            "poster_path": data.get("poster_path"),
+            "release_date": data.get("release_date"),
             "genre_ids": data.get("genre_ids") or [],
             "person_ids": cast_ids + director_ids,
             "vote_average": data.get("vote_average") or 0,
@@ -140,6 +142,7 @@ def _upsert_movie_stub(m: dict) -> dict:
         "id": m["id"],
         "title": m.get("title"),
         "poster_path": m.get("poster_path"),
+        "backdrop_path": m.get("backdrop_path"),
         "release_date": m.get("release_date"),
         "vote_average": m.get("vote_average") or None,
         "genre_ids": m.get("genre_ids") or [],
@@ -281,6 +284,7 @@ def _compute(user_id: str, supabase) -> list[dict]:
                 "top_contributor": top_contributor,
                 "title": m.get("title"),
                 "poster_path": m.get("poster_path"),
+                "backdrop_path": m.get("backdrop_path"),
                 "release_date": m.get("release_date"),
                 "vote_average": m.get("vote_average") or 0,
                 "genre_ids": m.get("genre_ids") or [],
@@ -376,6 +380,7 @@ def _compute(user_id: str, supabase) -> list[dict]:
                 "top_contributor": None,
                 "title": None,
                 "poster_path": None,
+                "backdrop_path": None,
                 "release_date": None,
                 "vote_average": 0,
                 "genre_ids": [],
@@ -414,6 +419,12 @@ def _compute(user_id: str, supabase) -> list[dict]:
     for mid, info in enrich_info.items():
         c = candidates[mid]
         c["title"] = c["title"] or info["title"]
+        # Backfill from the authoritative TMDB details fetch whenever the
+        # candidate-generation source (a TMDB list item, or a bare friend-
+        # rated movie_id with no list data at all) didn't carry these —
+        # never overwrite a value that's already present.
+        c["poster_path"] = c["poster_path"] or info["poster_path"]
+        c["release_date"] = c["release_date"] or info["release_date"]
         c["genre_ids"] = info["genre_ids"] or c["genre_ids"]
         c["person_ids"] = info["person_ids"]
         if not c["vote_average"]:
