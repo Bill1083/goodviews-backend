@@ -188,3 +188,15 @@ def get_person_details(person_id: int) -> dict:
     data = _tmdb_get(f"/person/{person_id}", {"append_to_response": "movie_credits"})
     _cache_set(cache_key, data)
     return data
+
+
+def get_popular_people(page: int = 1) -> dict:
+    """Generically popular actors/directors — used as filler in the
+    onboarding favourites grid alongside genre/movie-seeded suggestions."""
+    cache_key = f"tmdb:people:popular:{page}"
+    cached = _cache_get(cache_key)
+    if cached:
+        return cached
+    data = _tmdb_get("/person/popular", {"page": page})
+    _cache_set(cache_key, data)
+    return data
