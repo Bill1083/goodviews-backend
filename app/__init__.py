@@ -2,6 +2,7 @@ from flask import Flask
 from flask_cors import CORS
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 from app.config import Config
 
@@ -11,6 +12,14 @@ limiter = Limiter(key_func=get_remote_address)
 def create_app() -> Flask:
     app = Flask(__name__)
     app.config.from_object(Config)
+
+    # nginx sits in front of every request (see the staging/prod nginx confs),
+    # so request.remote_addr is otherwise always nginx's own address — which
+    # made every rate limit a single bucket shared by every visitor to the
+    # site, not per-visitor. Trust exactly one proxy hop's X-Forwarded-For/
+    # X-Forwarded-Proto so get_remote_address (used by @limiter.limit
+    # everywhere) sees the real client IP.
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1)
 
     # CORS — only allow configured origins. allow_headers must be listed
     # explicitly (rather than relying on flask-cors' default) since prod
@@ -42,6 +51,7 @@ def create_app() -> Flask:
     from app.controllers.people import people_bp
     from app.controllers.favourites import favourites_bp
     from app.controllers.auth import auth_bp
+    from app.controllers.onboarding import onboarding_bp
 
     app.register_blueprint(movies_bp, url_prefix="/api/movies")
     app.register_blueprint(reviews_bp, url_prefix="/api/reviews")
@@ -54,6 +64,7 @@ def create_app() -> Flask:
     app.register_blueprint(people_bp, url_prefix="/api/people")
     app.register_blueprint(favourites_bp, url_prefix="/api/favourites")
     app.register_blueprint(auth_bp, url_prefix="/api/auth")
+    app.register_blueprint(onboarding_bp, url_prefix="/api/onboarding")
 
     @app.get("/api/health")
     def health():

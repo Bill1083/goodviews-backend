@@ -6,6 +6,7 @@ from app.utils.sanitize import sanitize_text
 from app.utils.social import filter_friend_ids, filter_owned_group_ids
 from app.services import tmdb
 from app.services import movie_cache
+from app.services import recommendations
 from app.services.supabase_client import get_supabase
 from app.utils.errors import server_error
 
@@ -48,7 +49,7 @@ def trending():
 @movies_bp.get("/top-rated")
 @limiter.limit("60 per minute")
 def top_rated():
-    """All-time top-rated movies (placeholder feed for 'For You')."""
+    """All-time top-rated movies."""
     page = request.args.get("page", 1, type=int)
     page = max(1, min(page, 500))
 
@@ -57,6 +58,21 @@ def top_rated():
         return jsonify(data)
     except Exception as exc:
         return server_error("Failed to fetch top rated movies", exc, 502)
+
+
+@movies_bp.get("/for-you")
+@require_auth
+@limiter.limit("10 per minute")
+def for_you():
+    """Personalized recommendation feed — see app.services.recommendations.
+    ?force=true bypasses the 24h cache and recomputes immediately."""
+    user = request.current_user
+    force = request.args.get("force", "").lower() in ("true", "1")
+    try:
+        data = recommendations.get_recommendations_for_user(str(user.id), force=force)
+        return jsonify(data)
+    except Exception as exc:
+        return server_error("Failed to fetch recommendations", exc, 500)
 
 
 @movies_bp.get("/<int:movie_id>")
