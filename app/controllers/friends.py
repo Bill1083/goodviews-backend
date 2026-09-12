@@ -125,12 +125,15 @@ def friends_recent_activity():
         friend_ids = [f["id"] for f in visible_friends]
         friend_map = {f["id"]: f["username"] for f in visible_friends}
 
-        # Get reviews in the last 7 days for these friends
+        # Get reviews in the last 7 days for these friends — excluding
+        # onboarding "quick ratings" (a burst of several reviews created in
+        # a couple of minutes isn't genuine "just watched this" activity).
         reviews_result = (
             supabase.table("reviews")
             .select("id, user_id, movie_id, rating, review_text, rewatch_count, created_at, movies(id, title, poster_path, release_date)")
             .in_("user_id", friend_ids)
             .gte("created_at", since)
+            .eq("is_onboarding", False)
             .order("created_at", desc=True)
             .execute()
         )

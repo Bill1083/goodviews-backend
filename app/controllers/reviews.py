@@ -133,6 +133,7 @@ def create_review():
             "review_text": review_text,
             "category_id": category_id,
             "category_ids": category_ids,
+            "is_onboarding": bool(body.get("is_onboarding")),
         }
         result = supabase.table("reviews").insert(review_payload).execute()
         review = result.data[0]
