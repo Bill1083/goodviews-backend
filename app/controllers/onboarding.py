@@ -1,6 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from flask import Blueprint, jsonify
+from flask import Blueprint, current_app, jsonify
 
 from app import limiter
 from app.services import movie_cache
@@ -25,11 +25,17 @@ CURATED_MOVIE_IDS = [
 @require_auth
 @limiter.limit("10 per minute")
 def curated_movies():
+    # Each worker thread needs its own pushed Flask app context —
+    # movie_cache.get_movie relies on current_app (TTL config, TMDB API
+    # key), which a ThreadPoolExecutor worker doesn't inherit by default.
+    app = current_app._get_current_object()
+
     def _fetch(mid: int):
-        try:
-            return movie_cache.get_movie(mid, segments=("core",))
-        except Exception:
-            return None
+        with app.app_context():
+            try:
+                return movie_cache.get_movie(mid, segments=("core",))
+            except Exception:
+                return None
 
     try:
         movies = []

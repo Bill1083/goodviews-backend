@@ -1,7 +1,7 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, current_app, jsonify, request
 
 from app import limiter
 from app.utils.auth import require_auth
@@ -32,17 +32,23 @@ def _enrich_movies(movies: list[dict], supabase) -> list[dict]:
     if not to_enrich:
         return movies
 
+    # Each worker thread needs its own pushed Flask app context —
+    # movie_cache.get_movie relies on current_app (TTL config, TMDB API
+    # key), which a ThreadPoolExecutor worker doesn't inherit by default.
+    app = current_app._get_current_object()
+
     def _fetch_one(movie_id: int, movie: dict) -> tuple[int, dict]:
-        try:
-            fresh = movie_cache.get_movie(movie_id, segments=("core",))
-            update: dict = {}
-            if movie.get("genre_ids") is None and fresh.get("genre_ids"):
-                update["genre_ids"] = fresh["genre_ids"]
-            if movie.get("vote_average") is None and fresh.get("vote_average") is not None:
-                update["vote_average"] = fresh["vote_average"]
-            return movie_id, update
-        except Exception:
-            return movie_id, {}
+        with app.app_context():
+            try:
+                fresh = movie_cache.get_movie(movie_id, segments=("core",))
+                update: dict = {}
+                if movie.get("genre_ids") is None and fresh.get("genre_ids"):
+                    update["genre_ids"] = fresh["genre_ids"]
+                if movie.get("vote_average") is None and fresh.get("vote_average") is not None:
+                    update["vote_average"] = fresh["vote_average"]
+                return movie_id, update
+            except Exception:
+                return movie_id, {}
 
     # movie_cache.get_movie already persists the core segment to the DB, so we
     # only need to merge the fetched values into the in-memory response here.

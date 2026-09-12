@@ -2,6 +2,8 @@ import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 
+from flask import current_app
+
 from app.services import movie_cache, tmdb
 from app.services.supabase_client import get_supabase
 
@@ -87,15 +89,22 @@ def _hydrate(items: list[dict], supabase) -> dict:
 def _fetch_credits(movie_ids: list[int]) -> dict[int, dict]:
     """Parallel-enriches a batch of movie ids with title/genre_ids/vote_average
     plus the top-5 billed cast ids + director ids, via the segmented cache —
-    same ThreadPoolExecutor pattern as reviews.py's _enrich_movies."""
+    same ThreadPoolExecutor pattern as reviews.py's _enrich_movies.
+
+    Each worker thread pushes its own Flask app context: movie_cache.get_movie
+    needs current_app (TTL config, TMDB API key), which isn't available in a
+    thread the request context wasn't pushed into by default."""
     if not movie_ids:
         return {}
 
+    app = current_app._get_current_object()
+
     def _one(mid: int):
-        try:
-            data = movie_cache.get_movie(mid, segments=("core",))
-        except Exception:
-            return mid, None
+        with app.app_context():
+            try:
+                data = movie_cache.get_movie(mid, segments=("core",))
+            except Exception:
+                return mid, None
         credits = data.get("credits") or {}
         cast_ids = [c["id"] for c in (credits.get("cast") or [])[:5] if c.get("id")]
         director_ids = [c["id"] for c in (credits.get("crew") or []) if c.get("job") == "Director" and c.get("id")]
@@ -393,11 +402,14 @@ def _compute(user_id: str, supabase) -> list[dict]:
             score += genre_affinity.get(gid, 0) - genre_penalty.get(gid, 0)
         for pid in c["person_ids"]:
             score += person_affinity.get(pid, 0) - person_penalty.get(pid, 0)
-        if c["provenance"] == "friend":
-            votes = friend_positive.get(mid, [])
-            if votes:
-                avg_friend_rating = sum(v for _, v in votes) / len(votes)
-                score += _FRIEND_BOOST_PER_FRIEND * len(votes) + 0.5 * (avg_friend_rating - 3)
+        # Applies whenever a friend rated this movie highly, regardless of
+        # provenance — a movie already found via seed_rec/favourite that a
+        # friend also loved should get credit for that too, not just the
+        # candidates discovered purely through friend signal.
+        votes = friend_positive.get(mid, [])
+        if votes:
+            avg_friend_rating = sum(v for _, v in votes) / len(votes)
+            score += _FRIEND_BOOST_PER_FRIEND * len(votes) + 0.5 * (avg_friend_rating - 3)
         scored.append((mid, score, c))
 
     # Dropping anything scoring <=0 is the concrete "1-2★ signal deprioritizes
