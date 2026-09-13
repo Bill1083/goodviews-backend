@@ -1,3 +1,4 @@
+import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
@@ -8,8 +9,10 @@ from app.utils.auth import require_auth
 from app.utils.sanitize import sanitize_text
 from app.utils.social import filter_friend_ids, filter_owned_group_ids
 from app.services.supabase_client import get_supabase
-from app.services import movie_cache
+from app.services import movie_cache, recommendations
 from app.utils.errors import server_error
+
+logger = logging.getLogger(__name__)
 
 reviews_bp = Blueprint("reviews", __name__)
 
@@ -140,6 +143,24 @@ def create_review():
 
         # Auto-remove from watchlist when a review is written
         supabase.table("watchlist").delete().eq("user_id", str(user.id)).eq("movie_id", movie_id).execute()
+
+        # Invalidate the cached For You feed so the next GET recomputes fresh
+        # instead of serving a stale 24h list that still reflects pre-review
+        # state. Deliberately lazy — no synchronous recompute here, that
+        # would slow down review submission with TMDB calls; the next
+        # GET /api/movies/for-you pays that cost instead.
+        try:
+            supabase.table("user_recommendations").delete().eq("user_id", str(user.id)).execute()
+        except Exception:
+            logger.exception("Failed to invalidate for-you cache after review")
+
+        # If the reviewed movie is one of this week's picks, patch just that
+        # slot out rather than showing an already-watched movie as a "Pick of
+        # the Week" for up to 7 days. Does not trigger a full weekly recompute.
+        try:
+            recommendations.handle_reviewed_movie_for_weekly_picks(str(user.id), movie_id)
+        except Exception:
+            logger.exception("Failed to patch weekly picks after review")
 
         # Only fan out to groups the caller actually owns and friends they actually
         # have — otherwise any logged-in user could spam arbitrary users/probe

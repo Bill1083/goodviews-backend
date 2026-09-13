@@ -75,6 +75,39 @@ def for_you():
         return server_error("Failed to fetch recommendations", exc, 500)
 
 
+@movies_bp.get("/picks-of-the-week")
+@require_auth
+@limiter.limit("10 per minute")
+def picks_of_the_week():
+    """3 hero recommendations — see app.services.recommendations. Refreshed
+    every 7 days; ?force=true bypasses that cache and recomputes immediately."""
+    user = request.current_user
+    force = request.args.get("force", "").lower() in ("true", "1")
+    try:
+        data = recommendations.get_weekly_picks_for_user(str(user.id), force=force)
+        return jsonify(data)
+    except Exception as exc:
+        return server_error("Failed to fetch picks of the week", exc, 500)
+
+
+@movies_bp.post("/not-interested")
+@require_auth
+@limiter.limit("30 per minute")
+def not_interested():
+    """Dismiss a For You recommendation and splice in a replacement without
+    waiting for the 24h cache refresh."""
+    user = request.current_user
+    body = request.get_json(silent=True) or {}
+    movie_id = body.get("movie_id")
+    if not movie_id or not isinstance(movie_id, int):
+        return jsonify({"error": "Valid movie_id (integer) is required"}), 400
+    try:
+        replacement = recommendations.mark_not_interested(str(user.id), movie_id)
+        return jsonify({"replacement": replacement})
+    except Exception as exc:
+        return server_error("Failed to mark as not interested", exc, 500)
+
+
 @movies_bp.get("/<int:movie_id>")
 @limiter.limit("60 per minute")
 def details(movie_id: int):
