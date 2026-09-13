@@ -19,6 +19,10 @@ MAX_GENRE_SHARE = 0.4
 MAX_PICKS_PER_PERSON = 2
 DIVERSITY_SLOTS = 3  # reserved for 3-star-seeded ("diversity") picks
 MAX_CANDIDATES_TO_ENRICH = 120
+# Scored-but-not-selected candidates kept as a replacement pool for
+# mark_not_interested (see _compute) — enough headroom to survive a fair
+# amount of dismissing before falling back to generic backfill.
+OVERFLOW_SIZE = 30
 
 # How much of the feed a single rated movie is allowed to seed, scaling with
 # how many movies the user has actually rated — one 5★ review shouldn't
@@ -68,9 +72,9 @@ def get_recommendations_for_user(user_id: str, force: bool = False) -> dict:
     if row and _is_fresh(row["computed_at"], CACHE_TTL):
         return _hydrate(row["items"], supabase)
 
-    items = _compute(user_id, supabase)
+    items, overflow = _compute(user_id, supabase)
     supabase.table("user_recommendations").upsert(
-        {"user_id": user_id, "items": items, "computed_at": datetime.now(timezone.utc).isoformat()},
+        {"user_id": user_id, "items": items, "overflow": overflow, "computed_at": datetime.now(timezone.utc).isoformat()},
         on_conflict="user_id",
     ).execute()
     return _hydrate(items, supabase)
@@ -109,51 +113,73 @@ def get_weekly_picks_for_user(user_id: str, force: bool = False) -> dict:
 def mark_not_interested(user_id: str, movie_id: int) -> dict | None:
     """Dismiss a For You recommendation: records it permanently (excluded
     from all future _compute() runs) and patches the cached feed in place
-    (no computed_at bump — this is a splice, not a recompute)."""
+    (no computed_at bump — this is a splice, not a recompute).
+
+    The replacement is drawn from `overflow` — the real scored-but-not-
+    selected candidates left over from the last full compute — so a
+    dismissed movie is replaced by an actual algorithmic pick, not generic
+    top-rated backfill (backfill is only a last resort once overflow is
+    exhausted). The dismissed slot is removed and the replacement is
+    appended at the end, not spliced into the vacated index — the
+    remaining items are already in rank order, so this naturally promotes
+    whatever was next-best into a higher position rather than letting an
+    unranked replacement jump the queue."""
     supabase = get_supabase()
     supabase.table("dismissed_recommendations").upsert(
         {"user_id": user_id, "movie_id": movie_id}, on_conflict="user_id,movie_id"
     ).execute()
 
-    cached = supabase.table("user_recommendations").select("items").eq("user_id", user_id).limit(1).execute()
+    cached = (
+        supabase.table("user_recommendations").select("items, overflow").eq("user_id", user_id).limit(1).execute()
+    )
     if not cached.data:
         return None
     items = cached.data[0]["items"]
+    overflow = cached.data[0].get("overflow") or []
     idx = next((i for i, it in enumerate(items) if it["movie_id"] == movie_id), None)
     if idx is None:
         return None
+    items.pop(idx)
 
-    exclude_ids = {it["movie_id"] for it in items} | {movie_id}
-    replacement = _backfill_items(exclude_ids, 1, supabase)
+    existing_ids = {it["movie_id"] for it in items} | {movie_id}
+    replacement = None
+    while overflow:
+        candidate = overflow.pop(0)
+        if candidate["movie_id"] not in existing_ids:
+            replacement = candidate
+            break
+
+    if replacement is None:
+        backfilled = _backfill_items(existing_ids, 1, supabase)
+        replacement = backfilled[0] if backfilled else None
+
     if replacement:
-        items[idx] = replacement[0]
-    else:
-        items.pop(idx)
+        items.append(replacement)
 
-    supabase.table("user_recommendations").update({"items": items}).eq("user_id", user_id).execute()
-    return _hydrate(replacement, supabase)["results"][0] if replacement else None
+    supabase.table("user_recommendations").update({"items": items, "overflow": overflow}).eq(
+        "user_id", user_id
+    ).execute()
+    return _hydrate([replacement], supabase)["results"][0] if replacement else None
 
 
 def handle_reviewed_movie_for_weekly_picks(user_id: str, movie_id: int) -> None:
-    """Consistency bonus: if the just-reviewed movie is one of this week's
-    picks, splice it out (same single-slot-patch idea as mark_not_interested)
-    instead of showing an already-watched movie as a 'Pick of the Week' for
-    up to 7 days. Does NOT trigger a full weekly recompute."""
+    """If the just-reviewed movie is one of this week's picks, invalidate the
+    whole cached row (rather than patching just that slot with generic
+    backfill) so the next fetch does a full real recompute — correctly
+    promoting whichever pick is genuinely next-best (e.g. #2 becomes #1)
+    instead of splicing an unranked replacement into the vacated rank.
+    Movie Picks of the Week is cheap enough to recompute in full — candidate
+    generation, not selection, is the expensive part, and it's only a
+    3-item endpoint with its own loading state — that this is simpler than
+    maintaining an overflow pool the way For You's mark_not_interested
+    does."""
     supabase = get_supabase()
     cached = supabase.table("user_weekly_picks").select("items").eq("user_id", user_id).limit(1).execute()
     if not cached.data:
         return
     items = cached.data[0]["items"]
-    idx = next((i for i, it in enumerate(items) if it["movie_id"] == movie_id), None)
-    if idx is None:
-        return
-    exclude_ids = {it["movie_id"] for it in items} | {movie_id}
-    replacement = _backfill_items(exclude_ids, 1, supabase)
-    if replacement:
-        items[idx] = replacement[0]
-    else:
-        items.pop(idx)
-    supabase.table("user_weekly_picks").update({"items": items}).eq("user_id", user_id).execute()
+    if any(it["movie_id"] == movie_id for it in items):
+        supabase.table("user_weekly_picks").delete().eq("user_id", user_id).execute()
 
 
 def _is_fresh(computed_at: str, ttl: timedelta) -> bool:
@@ -703,25 +729,32 @@ def _select_weekly_top3(scored: list[tuple[int, float, dict]], user_id: str, now
     return chosen
 
 
-def _compute(user_id: str, supabase) -> list[dict]:
+def _compute(user_id: str, supabase) -> tuple[list[dict], list[dict]]:
+    """Returns (items, overflow) — overflow is the next best-scored-but-not-
+    selected candidates (rank order, capped to OVERFLOW_SIZE), persisted
+    alongside items so mark_not_interested can promote a real algorithmic
+    pick into a vacated slot later instead of falling back to generic
+    top-rated backfill. Empty whenever items itself came from backfill
+    (cold start / no candidates at all)."""
     signals = _load_user_signals(user_id, supabase)
 
     if not signals.has_personalization():
         # Cold start: nothing to personalize on yet (shouldn't normally happen
         # once onboarding is complete, but is the safety net if it isn't).
-        return _backfill_items(
+        items = _backfill_items(
             signals.reviewed_ids | signals.watchlist_ids | signals.dismissed_ids, FEED_SIZE, supabase
         )
+        return items, []
 
     candidates, friend_positive, excluded_ids = _generate_candidates(
         user_id, supabase, signals, exclude_watchlist=True, extra_excluded_ids=signals.dismissed_ids
     )
     if not candidates:
-        return _backfill_items(excluded_ids, FEED_SIZE, supabase)
+        return _backfill_items(excluded_ids, FEED_SIZE, supabase), []
 
     scored = _score_candidates(candidates, signals, friend_positive)
     if not scored:
-        return _backfill_items(excluded_ids, FEED_SIZE, supabase)
+        return _backfill_items(excluded_ids, FEED_SIZE, supabase), []
 
     # ── Diversify: cap any one actor/director/genre's share of the final
     #    list, cap friend-provenance share to ~15%, and reserve a few slots
@@ -781,8 +814,15 @@ def _compute(user_id: str, supabase) -> list[dict]:
             if mid not in chosen_ids:
                 _try_add(mid, c)
 
+    # Everything scored but not selected, in rank order — the pool
+    # mark_not_interested draws real algorithmic replacements from later,
+    # rather than falling back to generic backfill for every dismissal.
+    selected_ids = {mid for mid, _ in selected}
+    overflow_candidates = [t for t in scored if t[0] not in selected_ids][:OVERFLOW_SIZE]
+
     # ── Persist stubs for anything not already cached ──────────────────────
     stubs = [_upsert_movie_stub({"id": mid, **c}) for mid, c in selected if c.get("title")]
+    stubs += [_upsert_movie_stub({"id": mid, **c}) for mid, _, c in overflow_candidates if c.get("title")]
     if stubs:
         try:
             supabase.table("movies").upsert(stubs, on_conflict="id").execute()
@@ -790,6 +830,10 @@ def _compute(user_id: str, supabase) -> list[dict]:
             logger.exception("Failed to upsert recommendation movie stubs")
 
     items = [{"movie_id": mid, "reason": _reason_for(c["provenance"], c["top_contributor"])} for mid, c in selected]
+    overflow = [
+        {"movie_id": mid, "reason": _reason_for(c["provenance"], c["top_contributor"])}
+        for mid, _, c in overflow_candidates
+    ]
 
     # Top up to FEED_SIZE with generic popular-movie backfill — always, not
     # just when things are sparse, since the review-based proportional cap
@@ -799,7 +843,7 @@ def _compute(user_id: str, supabase) -> list[dict]:
         chosen_ids = {mid for mid, _ in selected}
         items += _backfill_items(excluded_ids | chosen_ids, FEED_SIZE - len(items), supabase)
 
-    return _spread_by_reason(items)
+    return _spread_by_reason(items), overflow
 
 
 def _compute_weekly_picks(user_id: str, supabase) -> list[dict]:
