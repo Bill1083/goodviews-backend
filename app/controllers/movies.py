@@ -101,8 +101,11 @@ def not_interested():
     movie_id = body.get("movie_id")
     if not movie_id or not isinstance(movie_id, int):
         return jsonify({"error": "Valid movie_id (integer) is required"}), 400
+    scope = body.get("scope", "movie")
+    if scope not in ("movie", "type"):
+        return jsonify({"error": "scope must be 'movie' or 'type'"}), 400
     try:
-        replacement = recommendations.mark_not_interested(str(user.id), movie_id)
+        replacement = recommendations.mark_not_interested(str(user.id), movie_id, scope)
         return jsonify({"replacement": replacement})
     except Exception as exc:
         return server_error("Failed to mark as not interested", exc, 500)

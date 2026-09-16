@@ -43,6 +43,20 @@ _FRIEND_BOOST_PER_FRIEND = 2.0
 _PROVENANCE_BONUS = {"seed_rec": 0.5, "favourite": 0.3, "friend": 0.4, "diversity": 0.1}
 _VOTE_AVERAGE_WEIGHT = 0.1
 
+# "Not interested in these types of movies": demotes candidates in proportion
+# to how closely their overall profile matches the dismissed movie, rather
+# than penalising each of its genres independently the way 1-2★ ratings do —
+# so disliking one Action+Drama film sinks other Action+Drama films without
+# burying every Action or every Drama film. Genre overlap is squared Jaccard
+# (exact mix → full weight, one shared genre of two → a quarter), a shared
+# director adds half weight, each dislike halves in strength every
+# _TYPE_DISLIKE_HALF_LIFE_DAYS, and the total is capped so a handful of
+# dislikes can't stack into a de facto genre ban.
+_TYPE_DISLIKE_WEIGHT = 4.0
+_TYPE_DISLIKE_DIRECTOR_SHARE = 0.5
+_TYPE_DISLIKE_HALF_LIFE_DAYS = 120
+_TYPE_DISLIKE_CAP = 6.0
+
 # Movie Picks of the Week: comparable in scale to _FAVOURITE_BONUS — large
 # enough that a candidate which is both a strong recommendation AND already
 # on the watchlist clearly outranks an equally-scored non-watchlist one,
@@ -110,7 +124,7 @@ def get_weekly_picks_for_user(user_id: str, force: bool = False) -> dict:
     return _hydrate(items, supabase)
 
 
-def mark_not_interested(user_id: str, movie_id: int) -> dict | None:
+def mark_not_interested(user_id: str, movie_id: int, scope: str = "movie") -> dict | None:
     """Dismiss a For You recommendation: records it permanently (excluded
     from all future _compute() runs) and patches the cached feed in place
     (no computed_at bump — this is a splice, not a recompute).
@@ -123,10 +137,19 @@ def mark_not_interested(user_id: str, movie_id: int) -> dict | None:
     appended at the end, not spliced into the vacated index — the
     remaining items are already in rank order, so this naturally promotes
     whatever was next-best into a higher position rather than letting an
-    unranked replacement jump the queue."""
+    unranked replacement jump the queue.
+
+    scope="type" additionally records the dismissal as a soft taste signal
+    (see _type_dislike_penalty); it only affects the next full compute."""
     supabase = get_supabase()
     supabase.table("dismissed_recommendations").upsert(
-        {"user_id": user_id, "movie_id": movie_id}, on_conflict="user_id,movie_id"
+        {
+            "user_id": user_id,
+            "movie_id": movie_id,
+            "scope": scope,
+            "dismissed_at": datetime.now(timezone.utc).isoformat(),
+        },
+        on_conflict="user_id,movie_id",
     ).execute()
 
     cached = (
@@ -240,6 +263,7 @@ def _fetch_credits(movie_ids: list[int]) -> dict[int, dict]:
             "release_date": data.get("release_date"),
             "genre_ids": data.get("genre_ids") or [],
             "person_ids": cast_ids + director_ids,
+            "director_ids": director_ids,
             "vote_average": data.get("vote_average") or 0,
         }
 
@@ -335,6 +359,8 @@ class UserSignals:
     person_affinity: dict[int, float]
     genre_penalty: dict[int, float]
     person_penalty: dict[int, float]
+    # [{"genre_ids": set[int], "director_ids": set[int], "age_days": float}]
+    type_dislikes: list[dict]
 
     def has_personalization(self) -> bool:
         return bool(
@@ -350,10 +376,15 @@ def _load_user_signals(user_id: str, supabase) -> UserSignals:
     watchlist_ids = {
         r["movie_id"] for r in supabase.table("watchlist").select("movie_id").eq("user_id", user_id).execute().data
     }
-    dismissed_ids = {
-        r["movie_id"]
-        for r in supabase.table("dismissed_recommendations").select("movie_id").eq("user_id", user_id).execute().data
-    }
+    dismissals = (
+        supabase.table("dismissed_recommendations")
+        .select("movie_id, scope, dismissed_at")
+        .eq("user_id", user_id)
+        .execute()
+        .data
+    )
+    dismissed_ids = {r["movie_id"] for r in dismissals}
+    type_dismissals = [r for r in dismissals if r.get("scope") == "type"]
 
     fav_actors = (
         supabase.table("favorite_actors").select("actor_id, actor_name").eq("user_id", user_id).execute().data
@@ -374,7 +405,22 @@ def _load_user_signals(user_id: str, supabase) -> UserSignals:
 
     # ── Build affinity from the user's own ratings + explicit favourites ──
     seed_ids = list({r["movie_id"] for r in positive_seeds + diversity_seeds + negative_seeds})
-    seed_info = _fetch_credits(seed_ids)
+    # Type-dismissed movies ride along in the same credits batch; they aren't seeds.
+    seed_info = _fetch_credits(list(set(seed_ids) | {r["movie_id"] for r in type_dismissals}))
+
+    now = datetime.now(timezone.utc)
+    type_dislikes: list[dict] = []
+    for r in type_dismissals:
+        info = seed_info.get(r["movie_id"])
+        if not info:
+            continue
+        try:
+            age_days = max(0.0, (now - datetime.fromisoformat(r["dismissed_at"])).total_seconds() / 86400)
+        except (TypeError, ValueError):
+            age_days = 0.0
+        type_dislikes.append(
+            {"genre_ids": set(info["genre_ids"]), "director_ids": set(info["director_ids"]), "age_days": age_days}
+        )
 
     genre_affinity: dict[int, float] = {}
     person_affinity: dict[int, float] = {}
@@ -431,6 +477,7 @@ def _load_user_signals(user_id: str, supabase) -> UserSignals:
         person_affinity=person_affinity,
         genre_penalty=genre_penalty,
         person_penalty=person_penalty,
+        type_dislikes=type_dislikes,
     )
 
 
@@ -613,6 +660,7 @@ def _generate_candidates(
         c["release_date"] = c["release_date"] or info["release_date"]
         c["genre_ids"] = info["genre_ids"] or c["genre_ids"]
         c["person_ids"] = info["person_ids"]
+        c["director_ids"] = info["director_ids"]
         if not c["vote_average"]:
             c["vote_average"] = info["vote_average"]
 
@@ -642,7 +690,26 @@ def _ensure_watchlist_candidates(candidates: dict[int, dict], signals: UserSigna
             "vote_average": i["vote_average"],
             "genre_ids": i["genre_ids"],
             "person_ids": i["person_ids"],
+            "director_ids": i["director_ids"],
         }
+
+
+def _type_dislike_penalty(candidate: dict, type_dislikes: list[dict]) -> float:
+    """Similarity-weighted penalty from "not interested in these types" dismissals
+    (see the _TYPE_DISLIKE_* constants for the rationale). Candidates that were
+    never enriched have no director_ids and are judged on genre mix alone."""
+    if not type_dislikes:
+        return 0.0
+    genres = set(candidate.get("genre_ids") or [])
+    directors = set(candidate.get("director_ids") or [])
+    total = 0.0
+    for d in type_dislikes:
+        union = genres | d["genre_ids"]
+        genre_sim = len(genres & d["genre_ids"]) / len(union) if genres and d["genre_ids"] else 0.0
+        director_match = 1.0 if directors & d["director_ids"] else 0.0
+        decay = 0.5 ** (d["age_days"] / _TYPE_DISLIKE_HALF_LIFE_DAYS)
+        total += _TYPE_DISLIKE_WEIGHT * decay * (genre_sim**2 + _TYPE_DISLIKE_DIRECTOR_SHARE * director_match)
+    return min(_TYPE_DISLIKE_CAP, total)
 
 
 def _score_candidates(
@@ -669,6 +736,7 @@ def _score_candidates(
             score += _FRIEND_BOOST_PER_FRIEND * len(votes) + 0.5 * (avg_friend_rating - 3)
         if mid in watchlist_bonus_ids:
             score += watchlist_bonus
+        score -= _type_dislike_penalty(c, signals.type_dislikes)
         scored.append((mid, score, c))
 
     # Dropping anything scoring <=0 is the concrete "1-2★ signal deprioritizes

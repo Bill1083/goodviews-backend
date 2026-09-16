@@ -159,8 +159,8 @@ def force_refresh_movie(movie_id: int) -> dict:
 
 def prune_unwatched_movies(days: int | None = None) -> int:
     """Delete movie rows that haven't been viewed in `days` (default
-    MOVIE_PRUNE_AFTER_DAYS) AND aren't referenced by any watchlist, review, or
-    notification row — i.e. pure cache bloat from a movie someone looked at
+    MOVIE_PRUNE_AFTER_DAYS) AND aren't referenced by any watchlist, review,
+    notification, or dismissal row — i.e. pure cache bloat from a movie someone looked at
     once (via search click-through) and never watchlisted or reviewed.
     Rows with no last_viewed_at yet (e.g. only ever touched via
     POST /recommend, which is untouched by this refactor) are left alone
@@ -180,7 +180,9 @@ def prune_unwatched_movies(days: int | None = None) -> int:
         return 0
 
     referenced_ids: set[int] = set()
-    for table in ("watchlist", "reviews", "notifications"):
+    # dismissed_recommendations cascades on movie delete — pruning would silently
+    # un-dismiss the movie and erase any "types" preference attached to it.
+    for table in ("watchlist", "reviews", "notifications", "dismissed_recommendations"):
         refs = supabase.table(table).select("movie_id").in_("movie_id", candidate_ids).execute()
         referenced_ids.update(r["movie_id"] for r in refs.data if r.get("movie_id") is not None)
 
