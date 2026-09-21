@@ -1,4 +1,5 @@
 import logging
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -257,13 +258,20 @@ def _force_refresh_many(movie_ids: list[int]) -> int:
     app = current_app._get_current_object()
 
     def _refresh_one(mid: int) -> bool:
+        # One retry: under the Windows dev server, concurrent Supabase calls
+        # occasionally fail with a transient non-blocking-socket error
+        # (WinError 10035); a second attempt a moment later succeeds.
         with app.app_context():
-            try:
-                force_refresh_movie(mid)
-                return True
-            except Exception:
-                logger.exception("Failed to refresh movie %s", mid)
-                return False
+            for attempt in range(2):
+                try:
+                    force_refresh_movie(mid)
+                    return True
+                except Exception:
+                    if attempt == 0:
+                        time.sleep(0.5)
+                        continue
+                    logger.exception("Failed to refresh movie %s", mid)
+        return False
 
     with ThreadPoolExecutor(max_workers=10) as executor:
         return sum(1 for ok in executor.map(_refresh_one, movie_ids) if ok)
