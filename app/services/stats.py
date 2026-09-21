@@ -58,7 +58,7 @@ FRIEND_ID_CHUNK = 150
 # enough to mean something and the gap is wide enough to be a real "take".
 MIN_VOTE_COUNT_FOR_TAKES = 50
 HOT_TAKE_MIN_DELTA = 1.5
-AGREEMENT_MAX_DELTA = 1.0
+AGREEMENT_MAX_DELTA = 2.0  # one star on the 5-star scale, i.e. two points on TMDB's 10
 MIN_SHARED_FOR_COMPAT = 3
 BLOCKBUSTER_BUDGET = 100_000_000
 INDIE_BUDGET = 5_000_000
@@ -225,16 +225,28 @@ def load_taste_data(user_id: str, supabase) -> TasteData:
 
 
 def load_review_dates(user_id: str, supabase) -> list[datetime]:
-    """Just the timestamps of the user's non-onboarding reviews — enough to
-    say which years have a Wrapped, without loading any film data."""
+    """One timestamp per film (the newest organic review of it) — enough to
+    say which years have a Wrapped and how many films each holds, without
+    loading any film data. Deduplicated the same way film_rows() is, so the
+    hub card and the Wrapped itself agree on the count."""
     rows = paginate(
         lambda: supabase.table("reviews")
-        .select("created_at")
+        .select("movie_id, created_at")
         .eq("user_id", user_id)
         .eq("is_onboarding", False)
         .order("created_at", desc=True)
+        .order("id")
     )
-    return [dt for dt in (_parse_dt(r.get("created_at")) for r in rows) if dt]
+    seen: set[int] = set()
+    dates: list[datetime] = []
+    for r in rows:  # newest first, so the first sighting of a movie wins
+        movie_id = _as_int(r.get("movie_id"))
+        dt = _parse_dt(r.get("created_at"))
+        if movie_id is None or dt is None or movie_id in seen:
+            continue
+        seen.add(movie_id)
+        dates.append(dt)
+    return dates
 
 
 # ─── Normalisation ───────────────────────────────────────────────────────────
@@ -956,6 +968,10 @@ def _pct(share: float) -> int:
     return int(round(share * 100))
 
 
+def _stars(rating: float | None) -> str:
+    return f"{rating:.1f} stars" if rating is not None else "no ratings"
+
+
 def pick_persona(m: dict, year: int) -> dict:
     """Rule-based archetype. Fixed priority, first match wins — the rarer,
     more distinctive traits are checked first so a 120-film year that is
@@ -974,7 +990,7 @@ def pick_persona(m: dict, year: int) -> dict:
         ("devotee", m["top_genre_share"] >= 0.5 and top_genre is not None,
          f"{_pct(m['top_genre_share'])}% of your year was {top_genre}."),
         ("harsh_critic", (m["avg_rating"] is not None and m["avg_rating"] <= 2.8) or m["disliked_share"] >= 0.4,
-         f"Your average rating was {m['avg_rating']} stars, and {_pct(m['disliked_share'])}% of films got 2 stars or fewer."),
+         f"Your average rating was {_stars(m['avg_rating'])}, and {_pct(m['disliked_share'])}% of films got 2 stars or fewer."),
         ("enthusiast", m["loved_share"] >= 0.6,
          f"You loved {_pct(m['loved_share'])}% of everything you watched."),
         ("contrarian", m["agreement_share"] is not None and m["agreement_share"] <= 0.4 and m["agreement_sample"] >= 10,
@@ -998,7 +1014,7 @@ def pick_persona(m: dict, year: int) -> dict:
     if top_genre and key != "devotee":
         extra.append(f"{top_genre} was your most-watched genre.")
     if m["avg_rating"] is not None and key not in ("harsh_critic", "enthusiast"):
-        extra.append(f"Average rating: {m['avg_rating']} stars.")
+        extra.append(f"Average rating: {_stars(m['avg_rating'])}.")
     if m["top_director"] and key != "loyalist":
         extra.append(f"Most-watched director: {m['top_director']}.")
     persona = PERSONAS[key]
