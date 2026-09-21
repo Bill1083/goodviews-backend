@@ -6,6 +6,7 @@ from typing import Any
 from flask import current_app
 
 from app.services import tmdb
+from app.services.pg import chunked, paginate
 from app.services.supabase_client import get_supabase
 
 logger = logging.getLogger(__name__)
@@ -22,6 +23,18 @@ GENRE_MAP = {
     27: "Horror", 10402: "Music", 9648: "Mystery", 10749: "Romance",
     878: "Science Fiction", 10770: "TV Movie", 53: "Thriller", 10752: "War", 37: "Western",
 }
+
+# Slim, stats-friendly columns added by sql/008. Written on every core-segment
+# fetch from the same /movie/{id} payload as everything else (no extra TMDB
+# calls); read by app/services/stats.py. If PostgREST reports them missing
+# (migration not applied yet), _persist retries the write without them.
+STATS_COLUMNS = (
+    "directors", "top_cast", "original_language", "production_countries",
+    "budget", "revenue", "popularity", "vote_count",
+    "collection_id", "collection_name", "tagline",
+)
+
+TOP_CAST_LIMIT = 10
 
 
 def _segment_ttls() -> dict[str, timedelta]:
@@ -53,10 +66,43 @@ def _stale_segments(row: dict | None, requested: tuple[str, ...]) -> list[str]:
     return stale
 
 
+def _slim_person(person: dict) -> dict:
+    return {
+        "id": person.get("id"),
+        "name": person.get("name"),
+        "profile_path": person.get("profile_path"),
+    }
+
+
+def extract_people(credits: Any) -> tuple[list[dict] | None, list[dict] | None]:
+    """(directors, top_cast) in the slim shape stored beside the raw credits
+    jsonb — see sql/008 for why. Both are None when there is no credits
+    object at all, so "never fetched" stays distinguishable from "fetched,
+    nobody credited" ([])."""
+    if not isinstance(credits, dict):
+        return None, None
+    crew = credits.get("crew") or []
+    cast = credits.get("cast") or []
+    directors = [
+        _slim_person(c) for c in crew
+        if isinstance(c, dict) and c.get("job") == "Director" and c.get("id")
+    ]
+    billed = sorted(
+        (c for c in cast if isinstance(c, dict) and c.get("id")),
+        key=lambda c: c["order"] if isinstance(c.get("order"), int) else 10**6,
+    )
+    return directors, [_slim_person(c) for c in billed[:TOP_CAST_LIMIT]]
+
+
 def _extract_segment_fields(seg: str, tmdb_data: dict) -> dict:
     now = datetime.now(timezone.utc).isoformat()
     if seg == "core":
         genres = tmdb_data.get("genres") or []
+        directors, top_cast = extract_people(tmdb_data.get("credits"))
+        collection = tmdb_data.get("belongs_to_collection")
+        if not isinstance(collection, dict):
+            collection = {}
+        countries = tmdb_data.get("production_countries") or []
         return {
             "title": tmdb_data.get("title"),
             "poster_path": tmdb_data.get("poster_path"),
@@ -66,6 +112,21 @@ def _extract_segment_fields(seg: str, tmdb_data: dict) -> dict:
             "overview": tmdb_data.get("overview"),
             "runtime": tmdb_data.get("runtime"),
             "credits": tmdb_data.get("credits"),
+            # Stats columns (sql/008) — same payload, no extra TMDB calls.
+            "directors": directors,
+            "top_cast": top_cast,
+            "original_language": tmdb_data.get("original_language") or None,
+            "production_countries": [
+                c["iso_3166_1"] for c in countries if isinstance(c, dict) and c.get("iso_3166_1")
+            ],
+            # TMDB reports 0 for "unknown" — store NULL so averages aren't dragged down.
+            "budget": tmdb_data.get("budget") or None,
+            "revenue": tmdb_data.get("revenue") or None,
+            "popularity": tmdb_data.get("popularity"),
+            "vote_count": tmdb_data.get("vote_count"),
+            "collection_id": collection.get("id"),
+            "collection_name": collection.get("name"),
+            "tagline": tmdb_data.get("tagline") or None,
             "core_updated_at": now,
         }
     if seg == "media":
@@ -103,6 +164,44 @@ def _to_response(row: dict) -> dict[str, Any]:
     }
 
 
+def _is_missing_stats_column(exc: Exception) -> bool:
+    """PostgREST answers an UPDATE/UPSERT naming an unknown column with
+    PGRST204 ("Could not find the 'x' column of 'movies' in the schema cache")."""
+    message = str(exc)
+    return "PGRST204" in message or (
+        "column" in message.lower() and any(col in message for col in STATS_COLUMNS)
+    )
+
+
+def _persist(supabase, movie_id: int, update: dict, insert: bool) -> None:
+    """Writes a movie row. If the sql/008 stats columns don't exist yet, logs
+    loudly and retries without them — a missed migration must degrade to
+    "no taste stats", not break every movie click-through in the app."""
+
+    def _write(payload: dict) -> None:
+        if insert:
+            # Insert path: upsert needs the NOT NULL columns present (guaranteed by the caller).
+            supabase.table("movies").upsert(payload, on_conflict="id").execute()
+        else:
+            # Update path: a plain UPDATE only touches the columns we pass, so a
+            # partial payload (e.g. just last_viewed_at on an all-fresh row) can't
+            # trip NOT NULL constraints on columns we're not even setting — unlike
+            # upsert(), which validates a full candidate row before honoring the
+            # ON CONFLICT clause.
+            supabase.table("movies").update(payload).eq("id", movie_id).execute()
+
+    try:
+        _write(update)
+    except Exception as exc:
+        if not any(col in update for col in STATS_COLUMNS) or not _is_missing_stats_column(exc):
+            raise
+        logger.error(
+            "movies table is missing the sql/008 stats columns - apply the migration. "
+            "Writing movie %s without them.", movie_id,
+        )
+        _write({k: v for k, v in update.items() if k not in STATS_COLUMNS})
+
+
 def get_movie(movie_id: int, segments: tuple[str, ...] = ALL_SEGMENTS) -> dict:
     """Read-through cache: check the DB row first; fetch+persist only the
     requested segments that are missing or past their TTL; return the merged,
@@ -126,16 +225,7 @@ def get_movie(movie_id: int, segments: tuple[str, ...] = ALL_SEGMENTS) -> dict:
         for seg in stale:
             update.update(_extract_segment_fields(seg, tmdb_data))
 
-    if row is None:
-        # Insert path: upsert needs the NOT NULL columns present (guaranteed above).
-        supabase.table("movies").upsert(update, on_conflict="id").execute()
-    else:
-        # Update path: a plain UPDATE only touches the columns we pass, so a
-        # partial payload (e.g. just last_viewed_at on an all-fresh row) can't
-        # trip NOT NULL constraints on columns we're not even setting — unlike
-        # upsert(), which validates a full candidate row before honoring the
-        # ON CONFLICT clause.
-        supabase.table("movies").update(update).eq("id", movie_id).execute()
+    _persist(supabase, movie_id, update, insert=row is None)
 
     # A genuinely invalid movie_id already raises inside fetch_movie_segments
     # (TMDB 404 -> requests.raise_for_status()) before we get here, so by this
@@ -153,8 +243,30 @@ def force_refresh_movie(movie_id: int) -> dict:
     update: dict = {"id": movie_id, "last_viewed_at": datetime.now(timezone.utc).isoformat()}
     for seg in ALL_SEGMENTS:
         update.update(_extract_segment_fields(seg, tmdb_data))
-    get_supabase().table("movies").upsert(update, on_conflict="id").execute()
+    _persist(get_supabase(), movie_id, update, insert=True)
     return _to_response(update)
+
+
+def _force_refresh_many(movie_ids: list[int]) -> int:
+    """Force-refreshes each id from TMDB on a 10-worker pool; returns how many
+    succeeded. Each worker thread pushes its own Flask app context —
+    force_refresh_movie relies on current_app (TMDB API key), which a
+    ThreadPoolExecutor worker doesn't inherit by default."""
+    if not movie_ids:
+        return 0
+    app = current_app._get_current_object()
+
+    def _refresh_one(mid: int) -> bool:
+        with app.app_context():
+            try:
+                force_refresh_movie(mid)
+                return True
+            except Exception:
+                logger.exception("Failed to refresh movie %s", mid)
+                return False
+
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        return sum(1 for ok in executor.map(_refresh_one, movie_ids) if ok)
 
 
 def prune_unwatched_movies(days: int | None = None) -> int:
@@ -221,26 +333,52 @@ def refresh_stale_movies(max_age_days: int | None = None) -> int:
     if not stale_ids:
         return 0
 
-    # Each worker thread needs its own pushed Flask app context —
-    # force_refresh_movie relies on current_app (TMDB API key), which a
-    # ThreadPoolExecutor worker doesn't inherit by default.
-    app = current_app._get_current_object()
-
-    def _refresh_one(mid: int) -> bool:
-        with app.app_context():
-            try:
-                force_refresh_movie(mid)
-                return True
-            except Exception:
-                logger.exception("Failed to refresh stale movie %s", mid)
-                return False
-
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        refreshed = sum(1 for ok in executor.map(_refresh_one, stale_ids) if ok)
+    refreshed = _force_refresh_many(stale_ids)
     logger.info(
         "Refreshed %d/%d stale movie(s) older than %s days",
         refreshed, len(stale_ids), max_age_days or current_app.config["MOVIE_MAX_CACHE_AGE_DAYS"],
     )
+    return refreshed
+
+
+def backfill_movie_extras(limit: int | None = None) -> int:
+    """One-off after applying sql/008: re-fetches from TMDB every movie that
+    someone has reviewed or watchlisted and whose stats columns were never
+    written (original_language IS NULL — TMDB always supplies it, so NULL
+    means "last written by pre-008 code"). Only referenced movies: the rest
+    are cache bloat that prune-movies deletes anyway, and the monthly
+    refresh-stale-movies job fills them in over time regardless. Safe to
+    re-run (failures stay NULL and are retried); `limit` allows incremental
+    runs. Returns the number of movies refreshed."""
+    supabase = get_supabase()
+
+    referenced: set[int] = set()
+    for table in ("reviews", "watchlist"):
+        rows = paginate(lambda t=table: supabase.table(t).select("movie_id").order("movie_id"))
+        referenced.update(r["movie_id"] for r in rows if r.get("movie_id") is not None)
+    if not referenced:
+        return 0
+
+    missing: list[int] = []
+    for chunk in chunked(sorted(referenced)):
+        result = (
+            supabase.table("movies")
+            .select("id")
+            .in_("id", chunk)
+            .is_("original_language", "null")
+            .execute()
+        )
+        missing.extend(m["id"] for m in result.data)
+    if limit:
+        missing = missing[:limit]
+    if not missing:
+        logger.info("Extras backfill: nothing to do")
+        return 0
+
+    refreshed = 0
+    for chunk in chunked(missing, 100):
+        refreshed += _force_refresh_many(chunk)
+        logger.info("Extras backfill: %d/%d refreshed so far", refreshed, len(missing))
     return refreshed
 
 

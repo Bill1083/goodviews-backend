@@ -1,52 +1,15 @@
-import json
 import logging
 import time
-from typing import Any
 
-import redis
 import requests
 from flask import current_app
 
+# Redis-backed response cache. The helpers live in app/services/cache.py
+# (shared with the taste-stats caches); imported under the private names
+# every call site below has always used.
+from app.services.cache import cache_get as _cache_get, cache_set as _cache_set
+
 logger = logging.getLogger(__name__)
-
-_redis_client: redis.Redis | None = None
-CACHE_TTL_SECONDS = 60 * 60 * 24  # 24 hours
-
-
-def _get_redis() -> redis.Redis | None:
-    global _redis_client
-    if _redis_client is None:
-        try:
-            _redis_client = redis.from_url(
-                current_app.config["REDIS_URL"], decode_responses=True
-            )
-            _redis_client.ping()
-        except Exception:
-            logger.warning("Redis unavailable — TMDB responses will not be cached.")
-            _redis_client = None
-    return _redis_client
-
-
-def _cache_get(key: str) -> Any | None:
-    r = _get_redis()
-    if r is None:
-        return None
-    try:
-        value = r.get(key)
-        return json.loads(value) if value else None
-    except Exception:
-        return None
-
-
-def _cache_set(key: str, value: Any, ttl: int | None = None) -> None:
-    r = _get_redis()
-    if r is None:
-        return
-    try:
-        r.setex(key, ttl or CACHE_TTL_SECONDS, json.dumps(value))
-    except Exception:
-        pass
-
 
 _MAX_ATTEMPTS = 6
 

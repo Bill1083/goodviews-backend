@@ -3,6 +3,7 @@ from flask import Blueprint, jsonify, request
 from app import limiter
 from app.utils.auth import require_auth
 from app.utils.sanitize import sanitize_text
+from app.services import cache
 from app.services.supabase_client import get_supabase
 from app.utils.errors import server_error
 
@@ -57,6 +58,7 @@ def add_favourite_actor():
             },
             on_conflict="user_id,actor_id",
         ).execute()
+        cache.invalidate_user_stats(str(user.id))
         return jsonify({"ok": True}), 201
     except Exception as exc:
         return server_error("Failed to add favourite actor", exc, 500)
@@ -70,6 +72,7 @@ def remove_favourite_actor(person_id: int):
     supabase = get_supabase()
     try:
         supabase.table("favorite_actors").delete().eq("user_id", str(user.id)).eq("actor_id", person_id).execute()
+        cache.invalidate_user_stats(str(user.id))
         return jsonify({"ok": True}), 200
     except Exception as exc:
         return server_error("Failed to remove favourite actor", exc, 500)
@@ -123,6 +126,7 @@ def add_favourite_director():
             },
             on_conflict="user_id,director_id",
         ).execute()
+        cache.invalidate_user_stats(str(user.id))
         return jsonify({"ok": True}), 201
     except Exception as exc:
         return server_error("Failed to add favourite director", exc, 500)
@@ -136,6 +140,7 @@ def remove_favourite_director(person_id: int):
     supabase = get_supabase()
     try:
         supabase.table("favorite_directors").delete().eq("user_id", str(user.id)).eq("director_id", person_id).execute()
+        cache.invalidate_user_stats(str(user.id))
         return jsonify({"ok": True}), 200
     except Exception as exc:
         return server_error("Failed to remove favourite director", exc, 500)

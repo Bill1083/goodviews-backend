@@ -6,7 +6,7 @@ from app import limiter
 from app.utils.auth import require_auth
 from app.utils.sanitize import sanitize_text
 from app.services.supabase_client import get_supabase
-from app.services import movie_cache
+from app.services import cache, movie_cache
 from app.utils.errors import server_error
 
 watchlist_bp = Blueprint("watchlist", __name__)
@@ -129,6 +129,7 @@ def add_to_watchlist():
             .insert({"user_id": str(user.id), "movie_id": movie_id})
             .execute()
         )
+        cache.invalidate_user_stats(str(user.id))
         return jsonify(result.data[0]), 201
     except Exception as exc:
         return server_error("Failed to add to watchlist", exc, 500)
@@ -145,6 +146,7 @@ def remove_from_watchlist(movie_id: int):
             .eq("user_id", str(user.id)) \
             .eq("movie_id", movie_id) \
             .execute()
+        cache.invalidate_user_stats(str(user.id))
         return jsonify({"message": "Removed from watchlist"}), 200
     except Exception as exc:
         return server_error("Failed to remove from watchlist", exc, 500)

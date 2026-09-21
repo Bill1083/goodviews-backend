@@ -9,7 +9,7 @@ from app.utils.auth import require_auth
 from app.utils.sanitize import sanitize_text
 from app.utils.social import filter_friend_ids, filter_owned_group_ids
 from app.services.supabase_client import get_supabase
-from app.services import movie_cache, recommendations
+from app.services import cache, movie_cache, recommendations
 from app.utils.errors import server_error
 
 logger = logging.getLogger(__name__)
@@ -144,6 +144,10 @@ def create_review():
         # Auto-remove from watchlist when a review is written
         supabase.table("watchlist").delete().eq("user_id", str(user.id)).eq("movie_id", movie_id).execute()
 
+        # Taste dashboard / Wrapped caches are versioned per user - bump so
+        # the next profile visit recomputes (see app/services/cache.py).
+        cache.invalidate_user_stats(str(user.id))
+
         # Invalidate the cached For You feed so the next GET recomputes fresh
         # instead of serving a stale 24h list that still reflects pre-review
         # state. Deliberately lazy — no synchronous recompute here, that
@@ -269,6 +273,7 @@ def update_review(review_id: str):
             review = result.data[0] if result.data else existing
         else:
             review = existing
+        cache.invalidate_user_stats(str(user.id))
 
         # Expand group_ids to individual member notifications — only for groups the
         # caller actually owns
@@ -341,6 +346,7 @@ def increment_rewatch(review_id: str):
         new_count = current + 1
 
         supabase.table("reviews").update({"rewatch_count": new_count}).eq("id", review_id).eq("user_id", str(user.id)).execute()
+        cache.invalidate_user_stats(str(user.id))
         return jsonify({"rewatch_count": new_count}), 200
     except Exception as exc:
         return server_error("Failed to update rewatch count", exc, 500)
@@ -367,6 +373,7 @@ def decrement_rewatch(review_id: str):
         new_count = max(0, current - 1)
 
         supabase.table("reviews").update({"rewatch_count": new_count}).eq("id", review_id).eq("user_id", str(user.id)).execute()
+        cache.invalidate_user_stats(str(user.id))
         return jsonify({"rewatch_count": new_count}), 200
     except Exception as exc:
         return server_error("Failed to update rewatch count", exc, 500)
@@ -478,6 +485,7 @@ def delete_review(review_id: str):
         )
         if not result.data:
             return jsonify({"error": "Review not found or not owned by user"}), 404
+        cache.invalidate_user_stats(str(user.id))
         return jsonify({"deleted": True}), 200
     except Exception as exc:
         return server_error("Failed to delete review", exc, 500)

@@ -2,6 +2,7 @@ from flask import Blueprint, jsonify, request
 
 from app import limiter
 from app.utils.auth import require_auth
+from app.services import cache
 from app.services.supabase_client import get_supabase
 from app.utils.errors import server_error
 
@@ -211,6 +212,9 @@ def send_friend_request():
             ]).execute()
             supabase.table("friend_requests").delete() \
                 .eq("sender_id", friend_id).eq("receiver_id", str(user.id)).execute()
+            # Friend-compatibility stats change for both people.
+            cache.invalidate_user_stats(str(user.id))
+            cache.invalidate_user_stats(friend_id)
             return jsonify({"message": "Friend added"}), 201
         except Exception as exc:
             return server_error("Failed to add friend", exc, 500)
@@ -282,6 +286,8 @@ def accept_friend_request(request_id):
             {"user_id": sender_id, "friend_id": str(user.id)},
         ]).execute()
         supabase.table("friend_requests").delete().eq("id", request_id).execute()
+        cache.invalidate_user_stats(str(user.id))
+        cache.invalidate_user_stats(sender_id)
         return jsonify({"message": "Friend request accepted"}), 200
     except Exception as exc:
         return server_error("Failed to accept request", exc, 500)
@@ -322,6 +328,8 @@ def remove_friend(friend_id):
             .eq("user_id", str(user.id)).eq("friend_id", friend_id).execute()
         supabase.table("friendships").delete() \
             .eq("user_id", friend_id).eq("friend_id", str(user.id)).execute()
+        cache.invalidate_user_stats(str(user.id))
+        cache.invalidate_user_stats(friend_id)
         return jsonify({"message": "Friend removed"}), 200
     except Exception as exc:
         return server_error("Failed to remove friend", exc, 500)

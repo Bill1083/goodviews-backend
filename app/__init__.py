@@ -1,3 +1,4 @@
+import click
 from flask import Flask
 from flask_cors import CORS
 from flask_limiter import Limiter
@@ -52,6 +53,7 @@ def create_app() -> Flask:
     from app.controllers.favourites import favourites_bp
     from app.controllers.auth import auth_bp
     from app.controllers.onboarding import onboarding_bp
+    from app.controllers.stats import stats_bp
 
     app.register_blueprint(movies_bp, url_prefix="/api/movies")
     app.register_blueprint(reviews_bp, url_prefix="/api/reviews")
@@ -65,6 +67,7 @@ def create_app() -> Flask:
     app.register_blueprint(favourites_bp, url_prefix="/api/favourites")
     app.register_blueprint(auth_bp, url_prefix="/api/auth")
     app.register_blueprint(onboarding_bp, url_prefix="/api/onboarding")
+    app.register_blueprint(stats_bp, url_prefix="/api/stats")
 
     @app.get("/api/health")
     def health():
@@ -92,5 +95,17 @@ def create_app() -> Flask:
 
         refreshed = movie_cache.refresh_stale_movies()
         print(f"Refreshed {refreshed} stale movie(s).")
+
+    @app.cli.command("backfill-movie-extras")
+    @click.option("--limit", default=0, type=int, help="Refresh at most this many movies (0 = all).")
+    def backfill_movie_extras_command(limit: int):
+        """One-off after applying sql/008: fills the stats columns (directors,
+        top_cast, language, countries, budget, ...) for every movie referenced
+        by a review or watchlist entry by re-fetching it from TMDB. Safe to
+        re-run - only rows still missing the columns are touched."""
+        from app.services import movie_cache
+
+        refreshed = movie_cache.backfill_movie_extras(limit or None)
+        print(f"Backfilled extras for {refreshed} movie(s).")
 
     return app
