@@ -1,7 +1,7 @@
 """HTTP-level tests for /api/stats: auth, timezone validation, the Wrapped
-unlock gate (423 before the date, never any data), and the preview flag.
-Supabase and the aggregation loaders are stubbed — the maths is covered in
-test_stats.py."""
+unlock window (nothing announced before December, 423 on the year itself) and
+the year-round history. Supabase and the aggregation loaders are stubbed —
+the maths is covered in test_stats.py."""
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
@@ -15,6 +15,7 @@ from app.utils import auth as auth_utils
 UTC = timezone.utc
 SEPTEMBER = datetime(2026, 9, 21, 12, 0, tzinfo=UTC)
 DECEMBER = datetime(2026, 12, 3, 12, 0, tzinfo=UTC)
+NEW_YEAR = datetime(2027, 1, 2, 12, 0, tzinfo=UTC)
 
 
 def _movie(mid: int) -> dict:
@@ -27,20 +28,17 @@ def _movie(mid: int) -> dict:
     }
 
 
+def _review(rid: int, created_at: str, rating: int = 4) -> dict:
+    return {
+        "id": f"r{rid}", "movie_id": rid, "rating": rating, "review_text": "", "rewatch_count": 0,
+        "category_ids": [], "is_onboarding": False, "created_at": created_at, "movies": _movie(rid),
+    }
+
+
 def _reviews() -> list[dict]:
-    rows = []
-    for i in range(1, 8):  # 7 films in 2026, 3 in 2025
-        rows.append({
-            "id": f"r{i}", "movie_id": i, "rating": 4, "review_text": "", "rewatch_count": 0,
-            "category_ids": [], "is_onboarding": False,
-            "created_at": f"2026-0{1 + i % 6}-10T20:00:00+00:00", "movies": _movie(i),
-        })
-    for i in range(8, 11):
-        rows.append({
-            "id": f"r{i}", "movie_id": i, "rating": 3, "review_text": "", "rewatch_count": 0,
-            "category_ids": [], "is_onboarding": False,
-            "created_at": "2025-06-10T20:00:00+00:00", "movies": _movie(i),
-        })
+    rows = [_review(i, f"2026-0{1 + i % 6}-10T20:00:00+00:00") for i in range(1, 8)]        # 7 in 2026
+    rows += [_review(i, "2025-06-10T20:00:00+00:00") for i in range(8, 14)]                 # 6 in 2025
+    rows += [_review(i, "2024-06-10T20:00:00+00:00") for i in range(14, 16)]                # 2 in 2024
     return rows
 
 
@@ -52,7 +50,10 @@ def client(monkeypatch):
     fake_user = SimpleNamespace(id="user-1", factors=[])
     monkeypatch.setattr(auth_utils, "_validate_token", lambda token: fake_user if token == "good" else None)
     monkeypatch.setattr(stats_controller, "get_supabase", lambda: object())
-    monkeypatch.setattr(stats_controller.stats, "load_taste_data", lambda user_id, sb: TasteData(user_id=user_id, reviews=_reviews()))
+    monkeypatch.setattr(
+        stats_controller.stats, "load_taste_data",
+        lambda user_id, sb, **kwargs: TasteData(user_id=user_id, reviews=_reviews()),
+    )
     monkeypatch.setattr(
         stats_controller.stats, "load_review_dates",
         lambda user_id, sb: [datetime.fromisoformat(r["created_at"]) for r in _reviews()],
@@ -76,23 +77,23 @@ def test_requires_auth(client):
     assert client.get("/api/stats/wrapped/2025", headers={"Authorization": "Bearer bad"}).status_code == 401
 
 
-def test_dashboard_returns_contract_and_validates_tz(client):
+def test_dashboard_returns_the_trimmed_contract_and_validates_tz(client):
     res = client.get("/api/stats/me?tz=Australia/Sydney", headers=AUTH)
     assert res.status_code == 200
     body = res.get_json()
-    assert body["headline"]["films"] == 10
+    assert set(body) == {"generated_at", "tz", "coverage", "headline", "genres", "genre_highlights", "watchlist"}
+    assert body["headline"]["films"] == 15
     assert body["tz"] == "Australia/Sydney"
-    assert len(body["activity"]["months"]) == 12
 
     assert client.get("/api/stats/me?tz=Mars/Olympus", headers=AUTH).status_code == 400
 
 
-def test_availability_hides_everything_about_a_locked_year(client):
+def test_before_december_the_profile_is_told_nothing_about_this_year(client):
     body = client.get("/api/stats/wrapped", headers=AUTH).get_json()
     assert body["current_year"] == 2026
-    years = {y["year"]: y for y in body["years"]}
-    assert years[2026] == {"year": 2026, "status": "locked", "unlocks_at": "2026-12-01T00:00:00+00:00"}
-    assert years[2025] == {"year": 2025, "status": "not_enough", "films": 3, "min_films": 5}
+    assert body["current"] is None
+    # Only past years that actually produced a Wrapped; 2024 had 2 films.
+    assert body["history"] == [{"year": 2025, "films": 6}]
 
 
 def test_current_year_is_423_until_december_then_ready(client, monkeypatch):
@@ -107,19 +108,30 @@ def test_current_year_is_423_until_december_then_ready(client, monkeypatch):
     assert body["status"] == "ready" and body["films"] == 7
     assert [s["kind"] for s in body["slides"]][:2] == ["intro", "volume"]
 
-    years = {y["year"]: y for y in client.get("/api/stats/wrapped", headers=AUTH).get_json()["years"]}
-    assert years[2026]["status"] == "ready" and years[2026]["films"] == 7
+    availability = client.get("/api/stats/wrapped", headers=AUTH).get_json()
+    assert availability["current"] == {"year": 2026, "status": "ready", "films": 7, "min_films": 5}
+    assert availability["history"] == [{"year": 2025, "films": 6}]
+
+
+def test_in_the_new_year_last_year_moves_into_the_history(client, monkeypatch):
+    monkeypatch.setattr(stats_controller, "_now", lambda: NEW_YEAR)
+    body = client.get("/api/stats/wrapped", headers=AUTH).get_json()
+    assert body["current_year"] == 2027
+    assert body["current"] is None
+    assert body["history"] == [{"year": 2026, "films": 7}, {"year": 2025, "films": 6}]
+    assert client.get("/api/stats/wrapped/2026", headers=AUTH).status_code == 200
 
 
 def test_preview_flag_unlocks_current_year_locally(client):
     client.app.config["WRAPPED_PREVIEW_UNLOCK"] = True
     assert client.get("/api/stats/wrapped/2026", headers=AUTH).status_code == 200
+    assert client.get("/api/stats/wrapped", headers=AUTH).get_json()["current"]["year"] == 2026
 
 
 def test_past_year_below_threshold_and_out_of_range_years(client):
-    res = client.get("/api/stats/wrapped/2025", headers=AUTH)
+    res = client.get("/api/stats/wrapped/2024", headers=AUTH)
     assert res.status_code == 200
     assert res.get_json()["status"] == "not_enough"
-    assert client.get("/api/stats/wrapped/2024", headers=AUTH).status_code == 404  # no activity
+    assert client.get("/api/stats/wrapped/2023", headers=AUTH).status_code == 404  # no activity
     assert client.get("/api/stats/wrapped/2030", headers=AUTH).status_code == 404  # future
     assert client.get("/api/stats/wrapped/1999", headers=AUTH).status_code == 404  # before the app existed

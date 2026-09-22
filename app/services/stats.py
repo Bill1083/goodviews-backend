@@ -115,8 +115,7 @@ class TasteData:
     user_id: str
     reviews: list[dict] = field(default_factory=list)
     watchlist: list[dict] = field(default_factory=list)
-    fav_actors: list[dict] = field(default_factory=list)
-    fav_directors: list[dict] = field(default_factory=list)
+    # Friends are only loaded for the Wrapped (load_taste_data's include_social).
     friends: list[dict] = field(default_factory=list)
     friend_reviews: list[dict] = field(default_factory=list)
 
@@ -146,11 +145,15 @@ def _load_reviews(user_id: str, supabase) -> list[dict]:
         return paginate(query(LEGACY_REVIEW_SELECT))
 
 
-def load_taste_data(user_id: str, supabase) -> TasteData:
+def load_taste_data(user_id: str, supabase, *, include_social: bool = True) -> TasteData:
     """All the rows one user's stats are computed from. Paginated where a
     table can exceed PostgREST's 1000-row cap; .in_() lists are chunked so
     URLs stay short. Friends' ratings are only fetched for films the user
-    has rated themselves — nothing about a friend's *other* films is loaded."""
+    has rated themselves — nothing about a friend's *other* films is loaded.
+
+    `include_social=False` skips the friend queries entirely: the profile
+    dashboard has no friend section (that comparison is a Wrapped reveal),
+    and those chunked lookups are the slowest part of the load."""
     reviews = _load_reviews(user_id, supabase)
     watchlist = paginate(
         lambda: supabase.table("watchlist")
@@ -159,22 +162,9 @@ def load_taste_data(user_id: str, supabase) -> TasteData:
         .order("added_at", desc=True)
         .order("movie_id")
     )
-    fav_actors = (
-        supabase.table("favorite_actors")
-        .select("actor_id, actor_name, profile_path")
-        .eq("user_id", user_id)
-        .execute()
-        .data
-        or []
-    )
-    fav_directors = (
-        supabase.table("favorite_directors")
-        .select("director_id, director_name, profile_path")
-        .eq("user_id", user_id)
-        .execute()
-        .data
-        or []
-    )
+    if not include_social:
+        return TasteData(user_id=user_id, reviews=reviews, watchlist=watchlist)
+
     friend_rows = (
         supabase.table("friendships")
         .select(FRIENDS_SELECT)
@@ -217,8 +207,6 @@ def load_taste_data(user_id: str, supabase) -> TasteData:
         user_id=user_id,
         reviews=reviews,
         watchlist=watchlist,
-        fav_actors=fav_actors,
-        fav_directors=fav_directors,
         friends=friends,
         friend_reviews=friend_reviews,
     )
@@ -404,17 +392,6 @@ def _streaks(days: list[date], today: date) -> tuple[int, int]:
     return current, longest
 
 
-def _trailing_months(now_local: datetime, count: int = 12) -> list[tuple[int, int]]:
-    year, month = now_local.year, now_local.month
-    months = []
-    for _ in range(count):
-        months.append((year, month))
-        month -= 1
-        if month == 0:
-            month, year = 12, year - 1
-    return list(reversed(months))
-
-
 def _delta_vs_world(f: FilmRow) -> float | None:
     """Your stars, doubled onto TMDB's 10-point scale, minus the crowd's
     score. None when the crowd is too small (or absent) to compare against."""
@@ -538,31 +515,6 @@ def _people(films: list[FilmRow]) -> dict:
         )[:5]
         return {"most_watched": most, "highest_rated": best}
     return {"directors": block("directors"), "actors": block("top_cast")}
-
-
-def _favourites(data: TasteData, films: list[FilmRow]) -> dict:
-    def coverage(favs: list[dict], id_key: str, name_key: str, attr: str) -> list[dict]:
-        out = []
-        for fav in favs:
-            pid = _as_int(fav.get(id_key))
-            if pid is None:
-                continue
-            seen = [f for f in films if any(p["id"] == pid for p in (getattr(f, attr) or []))]
-            best_first = sorted(seen, key=lambda f: (-f.rating, f.created_at))
-            out.append({
-                "id": pid,
-                "name": fav.get(name_key),
-                "profile_path": fav.get("profile_path"),
-                "seen_count": len(seen),
-                "avg_rating": _avg([f.rating for f in seen]),
-                "films": [_film_ref(f) for f in best_first[:4]],
-            })
-        return sorted(out, key=lambda p: (-p["seen_count"], p["name"] or ""))
-
-    return {
-        "actors": coverage(data.fav_actors, "actor_id", "actor_name", "top_cast"),
-        "directors": coverage(data.fav_directors, "director_id", "director_name", "directors"),
-    }
 
 
 def _rewatches(films: list[FilmRow], limit: int = 6) -> dict:
@@ -761,50 +713,21 @@ def _extras(films: list[FilmRow]) -> dict | None:
 # ─── Dashboard ───────────────────────────────────────────────────────────────
 
 def compute_dashboard(data: TasteData, *, now: datetime, tz: tzinfo) -> dict:
-    """All-time taste profile. Deliberately has no per-year view and no
-    persona/superlatives — those are the Wrapped's, and stay a surprise."""
+    """The profile's taste card: a few plain totals plus the genre breakdown.
+
+    Everything with a reveal in it — favourite films, most-watched people,
+    eras, rewatches, hot takes, taste twins, the year's rhythm — is
+    deliberately absent, and absent from the *payload* rather than merely
+    hidden in the UI, so a curious user can't read their Wrapped out of the
+    network tab either. Genres are the exception: the Taste DNA lives on the
+    profile by design, and the Wrapped's genre slide is a year-scoped view of
+    the same thing rather than a spoiler."""
     films = film_rows(data.reviews)
     organic = [f for f in films if not f.is_onboarding]
-    now_local = now.astimezone(tz)
-
-    ratings = [f.rating for f in films]
-    rounded = [int(round(f.rating)) for f in films]
-    distribution = [{"rating": r, "count": rounded.count(r)} for r in range(1, 6)]
-    loved = sum(1 for r in rounded if r >= 4)
-    okay = sum(1 for r in rounded if r == 3)
-    disliked = sum(1 for r in rounded if r <= 2)
-
     genres = _genre_table(films)
-
-    # Activity — organic reviews only, in the user's local time.
-    local_times = [f.created_at.astimezone(tz) for f in organic]
-    month_counts = Counter((t.year, t.month) for t in local_times)
-    months = [
-        {"month": f"{y:04d}-{m:02d}", "count": month_counts.get((y, m), 0)}
-        for y, m in _trailing_months(now_local)
-    ]
-    busiest = max(months, key=lambda m: m["count"]) if months else None
-    current_streak, longest_streak = _streaks([t.date() for t in local_times], now_local.date())
-    weekday_counts = [0] * 7
-    hour_counts = [0] * 24
-    for t in local_times:
-        weekday_counts[t.weekday()] += 1
-        hour_counts[t.hour] += 1
-
-    category_counts: Counter[str] = Counter()
-    category_ratings: dict[str, list[float]] = defaultdict(list)
-    for f in films:
-        for cid in set(f.category_ids):
-            category_counts[cid] += 1
-            category_ratings[cid].append(f.rating)
-    categories = sorted(
-        ({"category_id": cid, "count": n, "avg_rating": _avg(category_ratings[cid])} for cid, n in category_counts.items()),
-        key=lambda c: (-c["count"], c["category_id"]),
-    )
-
-    five_star = sorted((f for f in films if f.rating >= 5), key=lambda f: (-f.rewatch_count, f.created_at))
-    first_organic = min((f.created_at for f in organic), default=None)
-    last_organic = max((f.created_at for f in organic), default=None)
+    watchlist = _watchlist(data, films, now)
+    first = min((f.created_at for f in organic), default=None) or min((f.created_at for f in films), default=None)
+    last = max((f.created_at for f in organic), default=None) or max((f.created_at for f in films), default=None)
 
     return {
         "generated_at": _iso(now.astimezone(timezone.utc)),
@@ -819,42 +742,20 @@ def compute_dashboard(data: TasteData, *, now: datetime, tz: tzinfo) -> dict:
             "films": len(films),
             "films_excluding_onboarding": len(organic),
             "watch_minutes": sum(f.runtime * (1 + f.rewatch_count) for f in films if f.runtime),
-            "avg_rating": _avg(ratings),
+            "avg_rating": _avg([f.rating for f in films]),
             "rewatches": sum(f.rewatch_count for f in films),
+            "rewatched_films": sum(1 for f in films if f.rewatch_count > 0),
             "written_reviews": sum(1 for f in films if f.words),
             "written_words": sum(f.words for f in films),
-            "first_rated_at": _iso(first_organic or min((f.created_at for f in films), default=None)),
-            "last_rated_at": _iso(last_organic or max((f.created_at for f in films), default=None)),
-        },
-        "ratings": {
-            "distribution": distribution,
-            "loved_share": _share(loved, len(films)),
-            "okay_share": _share(okay, len(films)),
-            "disliked_share": _share(disliked, len(films)),
-            "most_common": max(distribution, key=lambda d: (d["count"], d["rating"]))["rating"] if films else None,
+            "first_rated_at": _iso(first),
+            "last_rated_at": _iso(last),
         },
         "genres": genres,
         "genre_highlights": _genre_highlights(genres),
-        "decades": _decades(films),
-        "eras": _eras(films),
-        "people": _people(films),
-        "favourites": _favourites(data, films),
-        "rewatches": _rewatches(films),
-        "activity": {
-            "months": months,
-            "busiest_month": busiest if busiest and busiest["count"] > 0 else None,
-            "current_streak_weeks": current_streak,
-            "longest_streak_weeks": longest_streak,
-            "weekday_counts": weekday_counts,
-            "hour_counts": hour_counts,
-        },
-        "categories": categories,
-        "top_rated": {"five_star_count": len(five_star), "films": [_rated(f) for f in five_star[:12]]},
-        "vs_world": _vs_world(films),
-        "runtime": _runtime(films),
-        "watchlist": _watchlist(data, films, now),
-        "friends": _friends(data, films),
-        "extras": _extras(films),
+        # Count and runtime only: which films are on the list, and how long the
+        # oldest has been waiting, are a Wrapped slide (and the list itself is
+        # already on My Movies).
+        "watchlist": {"count": watchlist["count"], "total_minutes": watchlist["total_minutes"]},
     }
 
 
@@ -960,6 +861,7 @@ SLIDE_THEMES = {
     "intro": "aurora", "volume": "neon", "months": "ocean", "genres": "sunset", "eras": "sepia",
     "people": "aurora", "loves": "gold", "hates": "noir", "hot_take": "ember", "critic": "ocean",
     "rewatches": "neon", "words": "sepia", "watchlist": "ocean", "friends": "sunset",
+    "runtime": "sunset",
     "hidden_gem": "aurora", "world": "sunset",
 }
 
@@ -1079,7 +981,7 @@ def compute_wrapped(data: TasteData, year: int, *, now: datetime, tz: tzinfo, mi
     def add(kind: str, payload: dict) -> None:
         slides.append({"kind": kind, "theme": SLIDE_THEMES.get(kind, "aurora"), **payload})
 
-    # 1. intro
+    # intro
     poster_wall = [f.poster_path for f in sorted(films, key=lambda f: (-f.rating, f.created_at)) if f.poster_path][:12]
     add("intro", {
         "films": len(films),
@@ -1088,7 +990,7 @@ def compute_wrapped(data: TasteData, year: int, *, now: datetime, tz: tzinfo, mi
         "poster_wall": poster_wall,
     })
 
-    # 2. volume
+    # volume
     add("volume", {
         "films": len(films),
         "minutes": minutes,
@@ -1097,7 +999,18 @@ def compute_wrapped(data: TasteData, year: int, *, now: datetime, tz: tzinfo, mi
         "avg_rating": _avg([f.rating for f in films]),
     })
 
-    # 3. months
+    # attention span
+    runtime = _runtime(films)
+    if runtime["sample_size"] >= 3 and runtime["longest"]:
+        add("runtime", {
+            "avg_minutes": runtime["avg_minutes"],
+            "longest": runtime["longest"],
+            "shortest": runtime["shortest"],
+            "share_over_2h": runtime["share_over_2h"],
+            "share_under_90m": runtime["share_under_90m"],
+        })
+
+    # months
     month_counts = Counter(t.month for t in local_times)
     month_list = [{"month": m, "count": month_counts.get(m, 0)} for m in range(1, 13)]
     elapsed = [m for m in month_list if year < now_local.year or m["month"] <= now_local.month]
@@ -1111,12 +1024,12 @@ def compute_wrapped(data: TasteData, year: int, *, now: datetime, tz: tzinfo, mi
         "longest_streak_weeks": longest_streak,
     })
 
-    # 4. genres
+    # genres
     surprise = next((g for g in genres if g["count"] <= 3 and (g["avg_rating"] or 0) >= 4.5 and g is not genres[0]), None)
     if genres:
         add("genres", {"top": genres[:5], "total_genres": len(genres), "surprise": surprise})
 
-    # 5. eras
+    # eras
     if eras["oldest"]:
         add("eras", {
             "decades": _decades(films),
@@ -1125,13 +1038,13 @@ def compute_wrapped(data: TasteData, year: int, *, now: datetime, tz: tzinfo, mi
             "mean_year": eras["mean_release_year"],
         })
 
-    # 6. people
+    # people
     director = people["directors"]["most_watched"][0] if people["directors"]["most_watched"] else None
     actor = people["actors"]["most_watched"][0] if people["actors"]["most_watched"] else None
     if director or actor:
         add("people", {"director": director, "actor": actor})
 
-    # 7. loves
+    # loves
     loved = sorted(
         (f for f in films if f.rating >= 4),
         key=lambda f: (-f.rating, -f.rewatch_count, -(_delta_vs_world(f) or 0), f.created_at),
@@ -1149,7 +1062,7 @@ def compute_wrapped(data: TasteData, year: int, *, now: datetime, tz: tzinfo, mi
             "film_of_the_year": {**_rated(top), "why": why + "."},
         })
 
-    # 8. hates — always present
+    # hates — always present
     disliked = sorted((f for f in films if f.rating <= 2), key=lambda f: (f.rating, -(f.vote_average or 0), f.created_at))
     add("hates", {
         "worst": [_rated(f) for f in disliked[:3]],
@@ -1157,13 +1070,13 @@ def compute_wrapped(data: TasteData, year: int, *, now: datetime, tz: tzinfo, mi
         "one_star_count": sum(1 for f in films if f.rating <= 1),
     })
 
-    # 9. hot take
+    # hot take
     takes = vs_world["hot_takes"]["loved_more"] + vs_world["hot_takes"]["loved_less"]
     if takes:
         take = max(takes, key=lambda t: abs(t["delta"]))
         add("hot_take", {**take, "direction": "higher" if take["delta"] > 0 else "lower"})
 
-    # 10. critic
+    # critic
     if vs_world["sample_size"] >= 5:
         world_avg = round(sum((f.vote_average or 0) for f in films if _delta_vs_world(f) is not None) / vs_world["sample_size"] / 2, 2)
         add("critic", {
@@ -1174,12 +1087,12 @@ def compute_wrapped(data: TasteData, year: int, *, now: datetime, tz: tzinfo, mi
             "agreement_share": vs_world["agreement_share"],
         })
 
-    # 11. rewatches (lifetime counts on films first rated this year)
+    # rewatches (lifetime counts on films first rated this year)
     rewatch = _rewatches(films, limit=3)
     if rewatch["total"] > 0:
         add("rewatches", rewatch)
 
-    # 12. words
+    # words
     written = [f for f in films if f.words]
     if written:
         longest = max(written, key=lambda f: (f.words, f.created_at))
@@ -1192,7 +1105,7 @@ def compute_wrapped(data: TasteData, year: int, *, now: datetime, tz: tzinfo, mi
             "longest": {"movie": _film_ref(longest), "words": longest.words, "excerpt": excerpt, "rating": longest.rating},
         })
 
-    # 13. watchlist
+    # watchlist
     wl = _watchlist(data, films, now)
     if wl["count"]:
         added_this_year = sum(
@@ -1201,7 +1114,7 @@ def compute_wrapped(data: TasteData, year: int, *, now: datetime, tz: tzinfo, mi
         )
         add("watchlist", {"total": wl["count"], "added_this_year": added_this_year, "oldest": wl["oldest"], "total_minutes": wl["total_minutes"]})
 
-    # 14. friends
+    # friends
     fr = _friends(data, films)
     if fr["twin"]:
         add("friends", {
@@ -1211,7 +1124,7 @@ def compute_wrapped(data: TasteData, year: int, *, now: datetime, tz: tzinfo, mi
             "compared": len(fr["compared"]),
         })
 
-    # 15. hidden gem + 16. world (need extras coverage)
+    # hidden gem + world (need extras coverage)
     extras = _extras(films)
     if extras:
         if extras["hidden_gems"]:
@@ -1223,7 +1136,7 @@ def compute_wrapped(data: TasteData, year: int, *, now: datetime, tz: tzinfo, mi
             "non_english_share": extras["languages"]["non_english_share"],
         })
 
-    # 17. persona
+    # persona
     with_year = [f for f in films if f.year]
     night = sum(1 for t in local_times if t.hour in NIGHT_HOURS)
     franchise_counts = Counter(f.collection_id for f in films if f.collection_id is not None)
@@ -1252,7 +1165,7 @@ def compute_wrapped(data: TasteData, year: int, *, now: datetime, tz: tzinfo, mi
     persona = pick_persona(metrics, year)
     slides.append({"kind": "persona", "theme": persona["theme"], **persona})
 
-    # 18. summary
+    # summary
     summary = {
         "films": len(films),
         "minutes": minutes,

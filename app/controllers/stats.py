@@ -75,7 +75,9 @@ def my_stats():
         return jsonify(cached)
 
     try:
-        data = stats.load_taste_data(user_id, get_supabase())
+        # No friend section on the dashboard (that comparison is a Wrapped
+        # reveal), so skip the friend queries — they are the slow half.
+        data = stats.load_taste_data(user_id, get_supabase(), include_social=False)
         payload = stats.compute_dashboard(data, now=_now(), tz=tz)
     except Exception as exc:
         return server_error("Failed to compute stats", exc, 500)
@@ -88,8 +90,12 @@ def my_stats():
 @require_auth
 @limiter.limit("30 per minute")
 def wrapped_availability():
-    """Which years have a Wrapped and whether each is viewable yet. A locked
-    year exposes nothing but its unlock time — not even a film count."""
+    """What the profile may show about the Wrapped.
+
+    `current` is the year in its reveal window — non-null only between the
+    unlock date and the end of that year, so before December the profile has
+    nothing to announce and no countdown to give the game away. `history` is
+    every earlier year that produced a Wrapped, available all year round."""
     user = request.current_user
     tz = _parse_tz()
     if tz is None:
@@ -102,25 +108,32 @@ def wrapped_availability():
         return server_error("Failed to load Wrapped availability", exc, 500)
 
     per_year = Counter(stats.wrapped_years([dt], tz)[0] for dt in dates)
-    years = set(per_year) | {now.year}
     min_films = current_app.config["WRAPPED_MIN_FILMS"]
 
-    out = []
-    for year in sorted(years, reverse=True):
-        status, unlocks_at = _unlock(year, now)
-        if status == "future" or year < EARLIEST_YEAR:
-            continue
-        if status == "locked":
-            out.append({"year": year, "status": "locked", "unlocks_at": unlocks_at.isoformat()})
-            continue
-        films = per_year.get(year, 0)
-        out.append({
-            "year": year,
+    current = None
+    if _unlock(now.year, now)[0] == "ready":
+        films = per_year.get(now.year, 0)
+        current = {
+            "year": now.year,
             "status": "ready" if films >= min_films else "not_enough",
             "films": films,
             "min_films": min_films,
-        })
-    return jsonify({"current_year": now.year, "server_time": now.isoformat(), "years": out})
+        }
+
+    history = [
+        {"year": year, "films": films}
+        for year, films in sorted(per_year.items(), reverse=True)
+        # A past year below the threshold can never reach it (the year is
+        # over), so it is simply not part of the history.
+        if EARLIEST_YEAR <= year < now.year and films >= min_films
+    ]
+
+    return jsonify({
+        "current_year": now.year,
+        "server_time": now.isoformat(),
+        "current": current,
+        "history": history,
+    })
 
 
 @stats_bp.get("/wrapped/<int:year>")

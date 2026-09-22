@@ -1,7 +1,12 @@
 """Pure-maths tests for the taste dashboard and Wrapped. Everything is built
 from plain dicts with an injected clock and timezone — no network, no Flask
-app context."""
+app context.
+
+The dashboard is deliberately thin (totals + genres), so the section builders
+it no longer calls are tested directly; they are what the Wrapped is made of.
+"""
 import itertools
+import json
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -75,13 +80,11 @@ def make_review(movie: dict, rating: float, created_at: datetime, **over) -> dic
     return row
 
 
-def make_data(reviews=(), watchlist=(), friends=(), friend_reviews=(), fav_actors=(), fav_directors=()) -> TasteData:
+def make_data(reviews=(), watchlist=(), friends=(), friend_reviews=()) -> TasteData:
     return TasteData(
         user_id="me",
         reviews=list(reviews),
         watchlist=list(watchlist),
-        fav_actors=list(fav_actors),
-        fav_directors=list(fav_directors),
         friends=list(friends),
         friend_reviews=list(friend_reviews),
     )
@@ -89,6 +92,18 @@ def make_data(reviews=(), watchlist=(), friends=(), friend_reviews=(), fav_actor
 
 def dashboard(data: TasteData, now: datetime = NOW, tz=UTC) -> dict:
     return compute_dashboard(data, now=now, tz=tz)
+
+
+def films_of(data: TasteData) -> list:
+    """The normalised rows every section builder takes."""
+    return film_rows(data.reviews)
+
+
+def year_of_films(count: int, year: int = 2026, **movie_over) -> list[dict]:
+    return [
+        make_review(make_movie(i, **movie_over), 5 if i % 2 else 2, datetime(year, 1 + (i % 9), 10, 20, 0, tzinfo=UTC))
+        for i in range(1, count + 1)
+    ]
 
 
 # ─── Normalisation ───────────────────────────────────────────────────────────
@@ -116,26 +131,38 @@ def test_rows_without_movie_or_timestamp_are_skipped():
     assert [f.movie_id for f in film_rows(rows)] == [2]
 
 
-# ─── Dashboard shape ─────────────────────────────────────────────────────────
+# ─── Dashboard: what it says, and what it refuses to ─────────────────────────
+
+DASHBOARD_KEYS = {"generated_at", "tz", "coverage", "headline", "genres", "genre_highlights", "watchlist"}
+
+
+def test_dashboard_withholds_everything_the_wrapped_reveals():
+    """The reveals are kept out of the payload, not just out of the UI — the
+    network tab must not spoil the Wrapped either."""
+    reviews = year_of_films(12, directors=[person(1, "Greta Gerwig")], top_cast=[person(2, "Saoirse Ronan")])
+    watchlist = [{"movie_id": 90, "added_at": (NOW - 40 * DAY).isoformat(), "movies": make_movie(90, title="Waiting Film")}]
+    friends = [{"id": "a", "username": "alice", "avatar_url": None, "avatar_color": None, "avatar_focal_y": None, "avatar_zoom": None}]
+    friend_reviews = [{"user_id": "a", "movie_id": i, "rating": 4, "created_at": NOW.isoformat()} for i in (1, 2, 3)]
+    out = dashboard(make_data(reviews, watchlist=watchlist, friends=friends, friend_reviews=friend_reviews))
+
+    assert set(out) == DASHBOARD_KEYS
+    assert set(out["watchlist"]) == {"count", "total_minutes"}
+
+    blob = json.dumps(out)
+    for spoiler in ("Film 1", "Waiting Film", "Greta Gerwig", "Saoirse Ronan", "alice", "poster_path"):
+        assert spoiler not in blob
+
 
 def test_empty_data_produces_full_shape_with_zeros():
     out = dashboard(make_data())
+    assert set(out) == DASHBOARD_KEYS
     assert out["headline"]["films"] == 0
     assert out["headline"]["avg_rating"] is None
-    assert out["ratings"]["distribution"] == [{"rating": r, "count": 0} for r in range(1, 6)]
+    assert out["headline"]["first_rated_at"] is None
     assert out["genres"] == []
     assert out["genre_highlights"]["most_watched"] is None
-    assert out["eras"]["oldest"] is None
-    assert out["people"]["directors"]["most_watched"] == []
-    assert len(out["activity"]["months"]) == 12
-    assert out["activity"]["busiest_month"] is None
-    assert out["activity"]["current_streak_weeks"] == 0
-    assert out["friends"] == {"friend_count": 0, "compared": [], "twin": None, "nemesis": None}
-    assert out["extras"] is None
-    assert out["watchlist"]["count"] == 0
-    assert out["vs_world"]["sample_size"] == 0
-    assert out["runtime"]["avg_minutes"] is None
-    assert out["top_rated"]["five_star_count"] == 0
+    assert out["coverage"] == {"films": 0, "with_runtime": 0, "with_people": 0, "with_extras": 0}
+    assert out["watchlist"] == {"count": 0, "total_minutes": 0}
 
 
 def test_headline_totals_and_rewatch_weighted_minutes():
@@ -150,23 +177,31 @@ def test_headline_totals_and_rewatch_weighted_minutes():
     assert head["watch_minutes"] == 100 * 3 + 90
     assert head["avg_rating"] == 4.0
     assert head["rewatches"] == 2
+    assert head["rewatched_films"] == 1
     assert head["written_reviews"] == 1
     assert head["written_words"] == 3
 
 
-def test_onboarding_counts_all_time_but_not_activity_or_wrapped():
+def test_watchlist_tile_counts_films_and_runtime():
+    watchlist = [
+        {"movie_id": 10, "added_at": (NOW - 30 * DAY).isoformat(), "movies": make_movie(10, runtime=90)},
+        {"movie_id": 11, "added_at": (NOW - 3 * DAY).isoformat(), "movies": make_movie(11, runtime=100)},
+    ]
+    assert dashboard(make_data([], watchlist=watchlist))["watchlist"] == {"count": 2, "total_minutes": 190}
+
+
+def test_onboarding_counts_all_time_but_never_in_a_wrapped():
     movie = make_movie(1)
     data = make_data([make_review(movie, 4, NOW - DAY, is_onboarding=True)])
     out = dashboard(data)
     assert out["headline"]["films"] == 1
     assert out["headline"]["films_excluding_onboarding"] == 0
-    assert all(m["count"] == 0 for m in out["activity"]["months"])
     wrapped = compute_wrapped(data, 2026, now=NOW, tz=UTC, min_films=1)
     assert wrapped["status"] == "not_enough"
     assert wrapped["films"] == 0
 
 
-# ─── Genres ──────────────────────────────────────────────────────────────────
+# ─── Genres (the one breakdown the profile keeps) ────────────────────────────
 
 def test_genre_table_affinity_and_highlight_gates():
     horror = make_movie(1, genre_ids=[27])
@@ -193,7 +228,7 @@ def test_genre_table_affinity_and_highlight_gates():
     assert [g["name"] for g in highlights["affinity_top"]] == ["Horror"]
 
 
-# ─── Taste vs the world ──────────────────────────────────────────────────────
+# ─── Section builders (the Wrapped's raw material) ───────────────────────────
 
 def test_hot_take_guards_and_deltas():
     beloved = make_movie(1, vote_average=8.6, vote_count=5000)      # you: 1 star -> delta -6.6
@@ -206,7 +241,7 @@ def test_hot_take_guards_and_deltas():
         make_review(unrated, 5, NOW - 3 * DAY),
         make_review(gem, 5, NOW - 4 * DAY),
     ])
-    vs = dashboard(data)["vs_world"]
+    vs = stats._vs_world(films_of(data))
     assert vs["sample_size"] == 2
     assert vs["mean_delta"] == pytest.approx((-6.6 + 5.0) / 2, abs=0.01)
     assert vs["label"] == "harsher"
@@ -215,7 +250,12 @@ def test_hot_take_guards_and_deltas():
     assert vs["hot_takes"]["loved_less"][0]["delta"] == pytest.approx(-6.6)
 
 
-# ─── People + favourites ─────────────────────────────────────────────────────
+def test_agreement_share_counts_films_within_one_star():
+    close = make_movie(1, vote_average=9.0, vote_count=800)   # you 5 -> delta +1.0, inside a star
+    far = make_movie(2, vote_average=4.0, vote_count=800)     # you 5 -> delta +6.0
+    data = make_data([make_review(close, 5, NOW - DAY), make_review(far, 5, NOW - 2 * DAY)])
+    assert stats._vs_world(films_of(data))["agreement_share"] == 0.5
+
 
 def test_people_most_watched_and_highest_rated_gate():
     nolan, villeneuve = person(1, "Christopher Nolan"), person(2, "Denis Villeneuve")
@@ -224,7 +264,7 @@ def test_people_most_watched_and_highest_rated_gate():
         make_review(make_movie(2, directors=[nolan]), 4, NOW - 2 * DAY),
         make_review(make_movie(3, directors=[villeneuve]), 5, NOW - 3 * DAY),
     ])
-    people = dashboard(data)["people"]
+    people = stats._people(films_of(data))
     assert people["directors"]["most_watched"][0]["name"] == "Christopher Nolan"
     assert people["directors"]["most_watched"][0]["count"] == 2
     assert people["directors"]["most_watched"][0]["avg_rating"] == 3.5
@@ -232,24 +272,6 @@ def test_people_most_watched_and_highest_rated_gate():
     assert [p["name"] for p in people["directors"]["highest_rated"]] == ["Christopher Nolan"]
     assert people["actors"]["most_watched"][0]["name"] == "Cillian"
 
-
-def test_favourite_coverage_uses_top_cast_and_directors():
-    actor = person(10, "Cillian")
-    data = make_data(
-        reviews=[
-            make_review(make_movie(1, top_cast=[actor]), 5, NOW - DAY),
-            make_review(make_movie(2, top_cast=[person(11, "Other")]), 2, NOW - 2 * DAY),
-        ],
-        fav_actors=[{"actor_id": 10, "actor_name": "Cillian", "profile_path": None}],
-        fav_directors=[{"director_id": 99, "director_name": "Nobody", "profile_path": None}],
-    )
-    favs = dashboard(data)["favourites"]
-    assert favs["actors"][0]["seen_count"] == 1
-    assert favs["actors"][0]["avg_rating"] == 5.0
-    assert favs["directors"][0]["seen_count"] == 0
-
-
-# ─── Friends ─────────────────────────────────────────────────────────────────
 
 def test_friend_compatibility_twin_nemesis_and_gate():
     movies = {i: make_movie(i) for i in range(1, 5)}
@@ -270,7 +292,8 @@ def test_friend_compatibility_twin_nemesis_and_gate():
         {"user_id": "c", "movie_id": 1, "rating": 5, "created_at": NOW.isoformat()},
         {"user_id": "c", "movie_id": 2, "rating": 4, "created_at": NOW.isoformat()},
     ]
-    out = dashboard(make_data(mine, friends=friends, friend_reviews=fr))["friends"]
+    data = make_data(mine, friends=friends, friend_reviews=fr)
+    out = stats._friends(data, films_of(data))
     assert out["friend_count"] == 3
     assert [c["username"] for c in out["compared"]] == ["alice", "bob"]  # cam: only 2 shared
     assert out["twin"]["username"] == "alice"
@@ -281,36 +304,16 @@ def test_friend_compatibility_twin_nemesis_and_gate():
     assert out["nemesis"]["most_disagreed"]["their_rating"] == 1
 
 
-# ─── Activity ────────────────────────────────────────────────────────────────
-
 def test_streaks_with_grace_week_and_gaps():
-    data = make_data([
-        make_review(make_movie(1), 4, NOW - 35 * DAY),  # isolated week
-        make_review(make_movie(2), 4, NOW - 14 * DAY),  # two consecutive weeks...
-        make_review(make_movie(3), 4, NOW - 7 * DAY),   # ...ending last week -> still "current"
-    ])
-    activity = dashboard(data)["activity"]
-    assert activity["longest_streak_weeks"] == 2
-    assert activity["current_streak_weeks"] == 2
-    assert sum(m["count"] for m in activity["months"]) == 3
-    assert activity["busiest_month"]["count"] >= 1
+    today = date(2026, 9, 21)  # a Monday
+    days = [date(2026, 8, 17), date(2026, 9, 7), date(2026, 9, 14)]
+    # Two consecutive weeks ending *last* week still counts as current.
+    assert stats._streaks(days, today) == (2, 2)
 
 
 def test_current_streak_breaks_after_two_quiet_weeks():
-    data = make_data([make_review(make_movie(1), 4, NOW - 21 * DAY)])
-    assert dashboard(data)["activity"]["current_streak_weeks"] == 0
+    assert stats._streaks([date(2026, 8, 31)], date(2026, 9, 21)) == (0, 1)
 
-
-def test_activity_buckets_use_local_time():
-    # 20:00 UTC on Dec 31 2025 is 07:00 on Jan 1 2026 in Sydney.
-    data = make_data([make_review(make_movie(1), 4, datetime(2025, 12, 31, 20, 0, tzinfo=UTC))])
-    syd_months = {m["month"]: m["count"] for m in dashboard(data, tz=SYD)["activity"]["months"]}
-    utc_months = {m["month"]: m["count"] for m in dashboard(data, tz=UTC)["activity"]["months"]}
-    assert syd_months["2026-01"] == 1
-    assert utc_months["2025-12"] == 1
-
-
-# ─── Watchlist / runtime / extras ────────────────────────────────────────────
 
 def test_watchlist_oldest_and_genre_gap():
     reviews = [make_review(make_movie(1, genre_ids=[18]), 4, NOW - DAY)]
@@ -319,7 +322,8 @@ def test_watchlist_oldest_and_genre_gap():
         {"movie_id": 11, "added_at": (NOW - 3 * DAY).isoformat(), "movies": make_movie(11, genre_ids=[27], runtime=100)},
         {"movie_id": 12, "added_at": (NOW - 2 * DAY).isoformat(), "movies": make_movie(12, genre_ids=[18], runtime=None)},
     ]
-    wl = dashboard(make_data(reviews, watchlist=watchlist))["watchlist"]
+    data = make_data(reviews, watchlist=watchlist)
+    wl = stats._watchlist(data, films_of(data), NOW)
     assert wl["count"] == 3
     assert wl["total_minutes"] == 190
     assert wl["oldest"]["movie"]["id"] == 10
@@ -333,7 +337,7 @@ def test_runtime_profile():
         make_review(make_movie(2, runtime=150), 5, NOW - 2 * DAY),
         make_review(make_movie(3, runtime=None), 4, NOW - 3 * DAY),
     ])
-    rt = dashboard(data)["runtime"]
+    rt = stats._runtime(films_of(data))
     assert rt["sample_size"] == 2
     assert rt["avg_minutes"] == 115
     assert rt["longest"]["id"] == 2
@@ -343,7 +347,7 @@ def test_runtime_profile():
 
 def test_extras_requires_coverage_then_reports_world_money_and_franchises():
     thin = make_data([make_review(make_movie(i), 4, NOW - i * DAY) for i in range(1, 6)])
-    assert dashboard(thin)["extras"] is None
+    assert stats._extras(films_of(thin)) is None
 
     reviews = []
     for i in range(1, 13):
@@ -357,44 +361,35 @@ def test_extras_requires_coverage_then_reports_world_money_and_franchises():
             collection_name="Big Saga" if i in (2, 4, 6) else None,
         )
         reviews.append(make_review(movie, 5 if i == 1 else 3, NOW - i * DAY))
-    extras = dashboard(make_data(reviews))["extras"]
+    extras = stats._extras(films_of(make_data(reviews)))
     assert extras["languages"]["count"] == 2
     assert extras["languages"]["non_english_share"] == pytest.approx(4 / 12, abs=0.001)
     assert extras["countries"]["count"] == 3
     assert extras["budget"]["blockbuster_count"] == 6
     assert extras["budget"]["indie_count"] == 6
     assert extras["hidden_gems"][0]["movie"]["id"] == 1
-    assert extras["franchises"][0] == {
-        "collection_id": 7, "name": "Big Saga", "count": 3, "avg_rating": 3.0,
-        "films": [{"id": i, "title": f"Film {i}", "poster_path": f"/p{i}.jpg", "backdrop_path": None, "release_date": "2010-05-01"} for i in (2, 4, 6)],
-    }
+    assert extras["franchises"][0]["collection_id"] == 7
+    assert extras["franchises"][0]["count"] == 3
 
 
 # ─── Wrapped ─────────────────────────────────────────────────────────────────
 
-def _year_of_films(count: int, year: int = 2026, **movie_over) -> list[dict]:
-    return [
-        make_review(make_movie(i, **movie_over), 5 if i % 2 else 2, datetime(year, 1 + (i % 9), 10, 20, 0, tzinfo=UTC))
-        for i in range(1, count + 1)
-    ]
-
-
 def test_wrapped_not_enough_below_threshold():
-    out = compute_wrapped(make_data(_year_of_films(4)), 2026, now=NOW, tz=UTC, min_films=5)
+    out = compute_wrapped(make_data(year_of_films(4)), 2026, now=NOW, tz=UTC, min_films=5)
     assert out == {"status": "not_enough", "year": 2026, "films": 4, "min_films": 5,
                    "generated_at": NOW.isoformat(), "tz": "UTC"}
 
 
 def test_wrapped_ready_has_ordered_core_slides_and_summary():
-    reviews = _year_of_films(8, directors=[person(1, "Greta Gerwig")], top_cast=[person(2, "Saoirse")])
+    reviews = year_of_films(8, directors=[person(1, "Greta Gerwig")], top_cast=[person(2, "Saoirse")])
     reviews.append(make_review(make_movie(99), 4, datetime(2025, 6, 1, tzinfo=UTC)))  # previous year: ignored
     out = compute_wrapped(make_data(reviews), 2026, now=NOW, tz=UTC, min_films=5)
     assert out["status"] == "ready"
     assert out["films"] == 8
     kinds = [s["kind"] for s in out["slides"]]
-    assert kinds[:3] == ["intro", "volume", "months"]
+    assert kinds[:3] == ["intro", "volume", "runtime"]
     assert kinds[-2:] == ["persona", "summary"]
-    for kind in ("genres", "eras", "people", "loves", "hates", "hot_take", "critic"):
+    for kind in ("months", "genres", "eras", "people", "loves", "hates", "hot_take", "critic"):
         assert kind in kinds
     assert "rewatches" not in kinds and "words" not in kinds and "friends" not in kinds
     loves = next(s for s in out["slides"] if s["kind"] == "loves")
@@ -411,6 +406,21 @@ def test_wrapped_ready_has_ordered_core_slides_and_summary():
     assert sum(m["count"] for m in months["months"]) == 8
 
 
+def test_wrapped_runtime_slide_carries_the_attention_span_stats():
+    reviews = [make_review(make_movie(i, runtime=100 + i * 10), 4, datetime(2026, 3, i, tzinfo=UTC)) for i in range(1, 7)]
+    out = compute_wrapped(make_data(reviews), 2026, now=NOW, tz=UTC, min_films=5)
+    slide = next(s for s in out["slides"] if s["kind"] == "runtime")
+    assert slide["longest"]["id"] == 6
+    assert slide["avg_minutes"] == 135
+    assert slide["theme"]
+
+
+def test_wrapped_omits_the_runtime_slide_without_enough_runtimes():
+    reviews = [make_review(make_movie(i, runtime=None), 4, datetime(2026, 3, i, tzinfo=UTC)) for i in range(1, 7)]
+    out = compute_wrapped(make_data(reviews), 2026, now=NOW, tz=UTC, min_films=5)
+    assert "runtime" not in [s["kind"] for s in out["slides"]]
+
+
 def test_wrapped_hates_slide_always_present_even_with_no_duds():
     reviews = [make_review(make_movie(i), 5, datetime(2026, 2, i, tzinfo=UTC)) for i in range(1, 7)]
     out = compute_wrapped(make_data(reviews), 2026, now=NOW, tz=UTC, min_films=5)
@@ -420,13 +430,21 @@ def test_wrapped_hates_slide_always_present_even_with_no_duds():
 
 def test_wrapped_year_boundary_uses_local_timezone():
     nye = datetime(2025, 12, 31, 20, 0, tzinfo=UTC)  # already Jan 1 2026 in Sydney
-    data = make_data([make_review(make_movie(i), 4, nye) for i in range(1, 6)] and
-                     [make_review(make_movie(i), 4, nye + timedelta(minutes=i)) for i in range(1, 6)])
+    reviews = [make_review(make_movie(i), 4, nye + timedelta(minutes=i)) for i in range(1, 7)]
+    data = make_data(reviews)
     assert wrapped_years([nye], SYD) == [2026]
     assert wrapped_years([nye], UTC) == [2025]
     assert compute_wrapped(data, 2026, now=NOW, tz=SYD, min_films=5)["status"] == "ready"
     assert compute_wrapped(data, 2026, now=NOW, tz=UTC, min_films=5)["status"] == "not_enough"
     assert compute_wrapped(data, 2025, now=NOW, tz=UTC, min_films=5)["status"] == "ready"
+
+
+def test_wrapped_month_buckets_use_local_time():
+    nye = datetime(2025, 12, 31, 20, 0, tzinfo=UTC)
+    reviews = [make_review(make_movie(i), 4, nye + timedelta(minutes=i)) for i in range(1, 7)]
+    syd = compute_wrapped(make_data(reviews), 2026, now=NOW, tz=SYD, min_films=5)
+    months = next(s for s in syd["slides"] if s["kind"] == "months")
+    assert months["busiest"] == {"month": 1, "count": 6}
 
 
 # ─── Persona ─────────────────────────────────────────────────────────────────
@@ -497,10 +515,12 @@ def test_unlock_status_preview_and_invalid_config_fallback():
     assert (status, at) == ("locked", datetime(2026, 12, 1, tzinfo=UTC))
 
 
-def test_unlock_check_is_utc_even_when_local_time_is_ahead():
-    # 11pm UTC Nov 30 is already Dec 1 in Sydney — still locked.
-    now = datetime(2026, 11, 30, 23, 0, tzinfo=SYD.utcoffset(datetime(2026, 11, 30)) and UTC)
-    assert unlock_status(2026, now=now, unlock_month_day="12-01")[0] == "locked"
+def test_a_finished_year_stays_open_as_history():
+    """New Year's Day: last year's Wrapped is no longer the current one, and
+    must still be readable — that's the history."""
+    new_year = datetime(2027, 1, 1, 0, 30, tzinfo=UTC)
+    assert unlock_status(2026, now=new_year, unlock_month_day="12-01") == ("ready", None)
+    assert unlock_status(2027, now=new_year, unlock_month_day="12-01")[0] == "locked"
 
 
 # ─── PostgREST helpers ───────────────────────────────────────────────────────
