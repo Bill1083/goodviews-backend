@@ -6,6 +6,7 @@ import requests as http_requests
 from app import limiter
 from app.utils.auth import require_auth
 from app.utils.sanitize import sanitize_str
+from app.utils.social import are_friends, load_friends_of, load_viewable_profile
 from app.services.supabase_client import get_supabase
 from app.services.movie_cache import GENRE_MAP
 from app.utils.errors import server_error
@@ -13,6 +14,14 @@ from app.utils.errors import server_error
 profile_bp = Blueprint("profile", __name__)
 
 VALID_VISIBILITY = ("no_one", "friends_only", "everyone")
+
+# The caller's own row: everything the settings screen can edit.
+SELF_PROFILE_COLUMNS = (
+    "id, username, bio, profile_visibility, avatar_color, avatar_url, avatar_focal_y, avatar_zoom, hide_recent_movies, hide_friends_list, mute_recommendations, mute_friend_requests, has_onboarded, onboarding_genre_ids"
+)
+LEGACY_SELF_PROFILE_COLUMNS = (
+    "id, username, bio, profile_visibility, avatar_color, avatar_url, avatar_focal_y, avatar_zoom, hide_recent_movies, mute_recommendations, mute_friend_requests, has_onboarded, onboarding_genre_ids"
+)
 
 # Avatars are picked from TMDB movie-poster art (see AvatarPicker on the client) rather than
 # uploaded, so we only ever need to accept TMDB's own image URLs here.
@@ -25,15 +34,69 @@ _AVATAR_URL_RE = re.compile(r"^https://image\.tmdb\.org/t/p/\w+/[A-Za-z0-9]+\.(j
 def get_profile():
     user = request.current_user
     supabase = get_supabase()
-    try:
-        result = (
+
+    def read(columns: str):
+        return (
             supabase.table("profiles")
-            .select("id, username, bio, profile_visibility, avatar_color, avatar_url, avatar_focal_y, avatar_zoom, hide_recent_movies, mute_recommendations, mute_friend_requests, has_onboarded, onboarding_genre_ids")
+            .select(columns)
             .eq("id", str(user.id))
             .single()
             .execute()
         )
+
+    try:
+        try:
+            result = read(SELF_PROFILE_COLUMNS)
+        except Exception as exc:
+            # sql/009 not applied yet — serve the profile without the new flag
+            # rather than breaking every page that reads it.
+            if "hide_friends_list" not in str(exc):
+                raise
+            result = read(LEGACY_SELF_PROFILE_COLUMNS)
         return jsonify(result.data)
+    except Exception as exc:
+        return server_error("Failed to fetch profile", exc, 500)
+
+
+@profile_bp.get("/<user_id>")
+@require_auth
+@limiter.limit("60 per minute")
+def get_public_profile(user_id: str):
+    """Someone else's profile, as far as their privacy settings allow.
+
+    profile_visibility decides whether the profile opens at all (this is the
+    release that starts enforcing it); hide_friends_list decides whether the
+    friends list comes with it. Nothing here is writable, and the private half
+    of the row — mute flags, onboarding state — is never selected."""
+    viewer = request.current_user
+    supabase = get_supabase()
+    try:
+        row, outcome = load_viewable_profile(supabase, str(viewer.id), user_id)
+        if outcome == "not_found":
+            return jsonify({"error": "Profile not found"}), 404
+        if outcome == "private":
+            # Deliberately no username/avatar in this response: a profile set to
+            # "no one" shouldn't confirm anything beyond its own existence.
+            return jsonify({"error": "private"}), 403
+
+        is_self = str(user_id) == str(viewer.id)
+        is_friend = False if is_self else are_friends(supabase, str(viewer.id), user_id)
+        # None (rather than []) means "they've hidden this", which the client
+        # renders as no section at all rather than an empty one.
+        friends = None if row.get("hide_friends_list") else load_friends_of(supabase, user_id)
+        return jsonify({
+            "id": row["id"],
+            "username": row.get("username"),
+            "bio": row.get("bio"),
+            "avatar_url": row.get("avatar_url"),
+            "avatar_color": row.get("avatar_color"),
+            "avatar_focal_y": row.get("avatar_focal_y"),
+            "avatar_zoom": row.get("avatar_zoom"),
+            "is_self": is_self,
+            "is_friend": is_friend,
+            "friends": friends,
+            "friend_count": None if friends is None else len(friends),
+        })
     except Exception as exc:
         return server_error("Failed to fetch profile", exc, 500)
 
@@ -107,6 +170,9 @@ def update_profile():
 
     if "hide_recent_movies" in body:
         updates["hide_recent_movies"] = bool(body["hide_recent_movies"])
+
+    if "hide_friends_list" in body:
+        updates["hide_friends_list"] = bool(body["hide_friends_list"])
 
     if "mute_recommendations" in body:
         updates["mute_recommendations"] = bool(body["mute_recommendations"])

@@ -14,6 +14,7 @@ from app.services.cache import cache_get, cache_set, stats_version
 from app.services.supabase_client import get_supabase
 from app.utils.auth import require_auth
 from app.utils.errors import server_error
+from app.utils.social import load_viewable_profile
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +59,23 @@ def _unlock(year: int, now: datetime) -> tuple[str, datetime | None]:
     )
 
 
+def _dashboard(user_id: str, tz: ZoneInfo):
+    """Whose stats these are is the only difference between the two routes —
+    the payload, the cache key and the TTL are identical, so a friend viewing
+    your profile reads the very same cached copy you do."""
+    key = _cache_key("dashboard", user_id, tz)
+    cached = cache_get(key)
+    if cached:
+        return jsonify(cached)
+
+    # No friend section on the dashboard (that comparison is a Wrapped
+    # reveal), so skip the friend queries — they are the slow half.
+    data = stats.load_taste_data(user_id, get_supabase(), include_social=False)
+    payload = stats.compute_dashboard(data, now=_now(), tz=tz)
+    cache_set(key, payload, ttl=current_app.config["STATS_DASHBOARD_TTL_SECONDS"])
+    return jsonify(payload)
+
+
 @stats_bp.get("/me")
 @require_auth
 @limiter.limit("30 per minute")
@@ -67,23 +85,31 @@ def my_stats():
     tz = _parse_tz()
     if tz is None:
         return jsonify({"error": "Invalid tz"}), 400
-    user_id = str(user.id)
-
-    key = _cache_key("dashboard", user_id, tz)
-    cached = cache_get(key)
-    if cached:
-        return jsonify(cached)
-
     try:
-        # No friend section on the dashboard (that comparison is a Wrapped
-        # reveal), so skip the friend queries — they are the slow half.
-        data = stats.load_taste_data(user_id, get_supabase(), include_social=False)
-        payload = stats.compute_dashboard(data, now=_now(), tz=tz)
+        return _dashboard(str(user.id), tz)
     except Exception as exc:
         return server_error("Failed to compute stats", exc, 500)
 
-    cache_set(key, payload, ttl=current_app.config["STATS_DASHBOARD_TTL_SECONDS"])
-    return jsonify(payload)
+
+@stats_bp.get("/user/<user_id>")
+@require_auth
+@limiter.limit("30 per minute")
+def user_stats(user_id: str):
+    """Someone else's taste card, behind the same gate as their profile —
+    the Wrapped is not reachable this way at any time of year."""
+    viewer = request.current_user
+    tz = _parse_tz()
+    if tz is None:
+        return jsonify({"error": "Invalid tz"}), 400
+    try:
+        _, outcome = load_viewable_profile(get_supabase(), str(viewer.id), user_id)
+        if outcome == "not_found":
+            return jsonify({"error": "Profile not found"}), 404
+        if outcome == "private":
+            return jsonify({"error": "private"}), 403
+        return _dashboard(str(user_id), tz)
+    except Exception as exc:
+        return server_error("Failed to compute stats", exc, 500)
 
 
 @stats_bp.get("/wrapped")
