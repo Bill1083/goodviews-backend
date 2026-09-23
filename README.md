@@ -28,13 +28,16 @@ network or a Redis; everything else is exercised manually.
 
 Schema lives in hosted Supabase. Files in `sql/` are applied by hand in the Supabase SQL editor,
 in order. Additive migrations must be applied **before** deploying the backend that writes the new
-columns (`sql/004`, `sql/008`).
+columns (`sql/004`, `sql/008`, `sql/009`).
 
 After applying `sql/008_movie_stats_columns.sql`, populate the new movie columns once:
 
 ```bash
 flask --app run.py backfill-movie-extras            # or --limit 200 for an incremental run
 ```
+
+`sql/009_friends_list_visibility.sql` adds the per-user friends-list switch used by public
+profiles. Reads fall back gracefully without it, but the settings toggle can't save until it's applied.
 
 ## Scheduled commands
 
