@@ -108,4 +108,14 @@ def create_app() -> Flask:
         refreshed = movie_cache.backfill_movie_extras(limit or None)
         print(f"Backfilled extras for {refreshed} movie(s).")
 
+    @app.cli.command("repair-missing-backdrops")
+    def repair_missing_backdrops_command():
+        """One-off: re-fetch films shown anywhere in the app that have no
+        backdrop stored — rows blanked by the recommendations stub bug, fixed
+        alongside this command. Safe to re-run."""
+        from app.services import movie_cache
+
+        missing, refreshed = movie_cache.repair_missing_backdrops()
+        print(f"{missing} film(s) had no backdrop; refreshed {refreshed}.")
+
     return app

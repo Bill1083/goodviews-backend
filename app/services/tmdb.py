@@ -1,28 +1,70 @@
 import logging
+import threading
 import time
+from collections.abc import Callable
 
 import requests
 from flask import current_app
+from requests.adapters import HTTPAdapter
 
 # Redis-backed response cache. The helpers live in app/services/cache.py
 # (shared with the taste-stats caches); imported under the private names
 # every call site below has always used.
-from app.services.cache import cache_get as _cache_get, cache_set as _cache_set
+from app.services.cache import CACHE_TTL_SECONDS, cache_get as _cache_get, cache_set as _cache_set
 
 logger = logging.getLogger(__name__)
 
 _MAX_ATTEMPTS = 6
+
+# (connect, read) for each attempt. A connect still pending after 3s is dead —
+# retrying is quicker than waiting it out.
+_TIMEOUT = (3.05, 8.0)
+
+# Wall-clock budget for one call, across all of its retries. This used to be
+# unbounded in practice: six attempts at a 10s timeout plus backoff is over a
+# minute, long after the browser (15s axios timeout) had given up and shown
+# "Something went wrong" — while the gunicorn worker stayed tied up the whole
+# time, so a slow spell at TMDB made the rest of the API sluggish too. Kept
+# under the client's timeout so the browser always gets a real answer.
+_DEADLINE_SECONDS = 10.0
+
+# Search results are cached for SEARCH_CACHE_TTL_SECONDS, and the last good
+# copy is kept this much longer as a fallback for when TMDB can't be reached.
+_STALE_TTL_SECONDS = 7 * 24 * 60 * 60
+
+_local = threading.local()
+
+
+def _session() -> requests.Session:
+    """One keep-alive session per thread. Every call used to open a brand-new
+    TCP + TLS connection, and new TLS handshakes are exactly what TMDB resets
+    from this host (see the backoff note in _tmdb_get) — a warm pooled
+    connection skips the handshake on most calls. Per thread rather than
+    shared, because the For You and refresh jobs fan out over
+    ThreadPoolExecutor workers."""
+    session = getattr(_local, "session", None)
+    if session is None:
+        session = requests.Session()
+        session.mount("https://", HTTPAdapter(pool_connections=2, pool_maxsize=4))
+        _local.session = session
+    return session
 
 
 def _tmdb_get(path: str, params: dict | None = None) -> dict:
     api_key = current_app.config["TMDB_API_KEY"]
     base_url = current_app.config["TMDB_BASE_URL"]
     merged_params = {"api_key": api_key, **(params or {})}
+    deadline = time.monotonic() + _DEADLINE_SECONDS
     last_exc: Exception | None = None
     for attempt in range(_MAX_ATTEMPTS):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.25:
+            break
         try:
-            response = requests.get(
-                f"{base_url}{path}", params=merged_params, timeout=10
+            response = _session().get(
+                f"{base_url}{path}",
+                params=merged_params,
+                timeout=(min(_TIMEOUT[0], remaining), min(_TIMEOUT[1], remaining)),
             )
             response.raise_for_status()
             return response.json()
@@ -39,8 +81,39 @@ def _tmdb_get(path: str, params: dict | None = None) -> dict:
             # roughly a 50% per-attempt failure rate, but each failure surfaces in
             # ~150-200ms, so several quick, lightly-backed-off retries clear it almost
             # every time without meaningfully adding to request latency.
-            time.sleep(min(0.25 * (attempt + 1), 1.5))
+            pause = min(0.25 * (attempt + 1), 1.5)
+            if time.monotonic() + pause >= deadline:
+                break
+            time.sleep(pause)
+    if last_exc is None:
+        last_exc = requests.Timeout(f"TMDB {path}: no attempt fitted in {_DEADLINE_SECONDS}s")
     raise last_exc
+
+
+def _search_key(kind: str, query: str, page: int) -> str:
+    """TMDB search ignores case and extra spaces, so the cache does too —
+    "Mirror Mask" and "mirror  mask" share one entry."""
+    return f"tmdb:{kind}:{' '.join(query.lower().split())}:{page}"
+
+
+def _cached_search(key: str, ttl: int, fetch: Callable[[], dict]) -> dict:
+    """Fresh cache, else TMDB, else the last good copy. The stale fallback
+    means a search someone has run before keeps working through a TMDB
+    outage instead of turning into an error screen."""
+    cached = _cache_get(key)
+    if cached:
+        return cached
+    try:
+        data = fetch()
+    except Exception:
+        stale = _cache_get(f"{key}:stale")
+        if stale:
+            logger.warning("TMDB unreachable; serving stale results for %s", key)
+            return stale
+        raise
+    _cache_set(key, data, ttl=ttl)
+    _cache_set(f"{key}:stale", data, ttl=_STALE_TTL_SECONDS)
+    return data
 
 
 def _sort_by_popularity(data: dict, key: str = "popularity") -> dict:
@@ -51,12 +124,11 @@ def _sort_by_popularity(data: dict, key: str = "popularity") -> dict:
 
 
 def search_movies(query: str, page: int = 1) -> dict:
-    cache_key = f"tmdb:search:{query}:{page}"
-    cached = _cache_get(cache_key)
-    if cached:
-        return _sort_by_popularity(cached)
-    data = _tmdb_get("/search/movie", {"query": query, "page": page})
-    _cache_set(cache_key, data, ttl=current_app.config["SEARCH_CACHE_TTL_SECONDS"])
+    data = _cached_search(
+        _search_key("search", query, page),
+        current_app.config["SEARCH_CACHE_TTL_SECONDS"],
+        lambda: _tmdb_get("/search/movie", {"query": query, "page": page}),
+    )
     return _sort_by_popularity(data)
 
 
@@ -134,12 +206,11 @@ def discover_movies(params: dict) -> dict:
 
 
 def search_people(query: str, page: int = 1) -> dict:
-    cache_key = f"tmdb:people:search:{query}:{page}"
-    cached = _cache_get(cache_key)
-    if cached:
-        return _sort_by_popularity(cached)
-    data = _tmdb_get("/search/person", {"query": query, "page": page, "include_adult": False})
-    _cache_set(cache_key, data)
+    data = _cached_search(
+        _search_key("people:search", query, page),
+        CACHE_TTL_SECONDS,
+        lambda: _tmdb_get("/search/person", {"query": query, "page": page, "include_adult": False}),
+    )
     return _sort_by_popularity(data)
 
 

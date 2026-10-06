@@ -390,6 +390,38 @@ def backfill_movie_extras(limit: int | None = None) -> int:
     return refreshed
 
 
+def repair_missing_backdrops() -> tuple[int, int]:
+    """Re-fetch every film that's on screen somewhere — a review, a watchlist,
+    a For You feed or this week's picks — but has no backdrop stored.
+
+    Until the stub fix in recommendations._upsert_movie_stub, computing
+    recommendations could overwrite a real backdrop with NULL, which left
+    Pick of the Week heroes, For You cards and Wrapped backgrounds blank.
+    This heals rows written before that fix; a film TMDB genuinely has no
+    backdrop for simply stays NULL. Safe to re-run. Returns
+    (films missing a backdrop, films refreshed)."""
+    supabase = get_supabase()
+    referenced: set[int] = set()
+    for table in ("reviews", "watchlist"):
+        rows = paginate(lambda t=table: supabase.table(t).select("movie_id").order("movie_id"))
+        referenced.update(r["movie_id"] for r in rows if r.get("movie_id") is not None)
+    for table, columns in (("user_weekly_picks", "items"), ("user_recommendations", "items, overflow")):
+        rows = paginate(lambda t=table, c=columns: supabase.table(t).select(c).order("user_id"))
+        for row in rows:
+            for key in ("items", "overflow"):
+                referenced.update(it["movie_id"] for it in (row.get(key) or []) if it.get("movie_id") is not None)
+
+    missing: list[int] = []
+    for chunk in chunked(sorted(referenced)):
+        result = supabase.table("movies").select("id").in_("id", chunk).is_("backdrop_path", "null").execute()
+        missing.extend(m["id"] for m in result.data)
+    if not missing:
+        return 0, 0
+    refreshed = _force_refresh_many(missing)
+    logger.info("Backdrop repair: refreshed %d/%d film(s)", refreshed, len(missing))
+    return len(missing), refreshed
+
+
 def get_movie_images(movie_id: int) -> dict:
     """Thin pass-through to tmdb.get_movie_images, so controllers only ever
     import movie_cache for movie_id-keyed data rather than app.services.tmdb

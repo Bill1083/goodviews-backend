@@ -125,8 +125,9 @@ def get_weekly_picks_for_user(user_id: str, force: bool = False) -> dict:
 
 
 def mark_not_interested(user_id: str, movie_id: int, scope: str = "movie") -> dict | None:
-    """Dismiss a For You recommendation: records it permanently (excluded
-    from all future _compute() runs) and patches the cached feed in place
+    """Dismiss a For You recommendation or a Pick of the Week: records it
+    permanently (excluded from all future computes of either), drops it from
+    this week's picks if it is one, and patches the cached For You feed in place
     (no computed_at bump — this is a splice, not a recompute).
 
     The replacement is drawn from `overflow` — the real scored-but-not-
@@ -151,6 +152,14 @@ def mark_not_interested(user_id: str, movie_id: int, scope: str = "movie") -> di
         },
         on_conflict="user_id,movie_id",
     ).execute()
+
+    # A Pick of the Week can be dismissed too (and may not be in For You at
+    # all), so this runs before the For You patch's early returns. The client
+    # refetches the picks; the recompute excludes the dismissal.
+    try:
+        _drop_from_weekly_picks(supabase, user_id, movie_id)
+    except Exception:
+        logger.exception("Failed to drop dismissed movie from weekly picks")
 
     cached = (
         supabase.table("user_recommendations").select("items, overflow").eq("user_id", user_id).limit(1).execute()
@@ -185,6 +194,18 @@ def mark_not_interested(user_id: str, movie_id: int, scope: str = "movie") -> di
     return _hydrate([replacement], supabase)["results"][0] if replacement else None
 
 
+def _drop_from_weekly_picks(supabase, user_id: str, movie_id: int) -> bool:
+    """If the movie is one of this week's picks, delete the cached row so the
+    next fetch does a full real recompute. Returns whether it was a pick."""
+    cached = supabase.table("user_weekly_picks").select("items").eq("user_id", user_id).limit(1).execute()
+    if not cached.data:
+        return False
+    if any(it["movie_id"] == movie_id for it in cached.data[0]["items"] or []):
+        supabase.table("user_weekly_picks").delete().eq("user_id", user_id).execute()
+        return True
+    return False
+
+
 def handle_reviewed_movie_for_weekly_picks(user_id: str, movie_id: int) -> None:
     """If the just-reviewed movie is one of this week's picks, invalidate the
     whole cached row (rather than patching just that slot with generic
@@ -196,13 +217,7 @@ def handle_reviewed_movie_for_weekly_picks(user_id: str, movie_id: int) -> None:
     3-item endpoint with its own loading state — that this is simpler than
     maintaining an overflow pool the way For You's mark_not_interested
     does."""
-    supabase = get_supabase()
-    cached = supabase.table("user_weekly_picks").select("items").eq("user_id", user_id).limit(1).execute()
-    if not cached.data:
-        return
-    items = cached.data[0]["items"]
-    if any(it["movie_id"] == movie_id for it in items):
-        supabase.table("user_weekly_picks").delete().eq("user_id", user_id).execute()
+    _drop_from_weekly_picks(get_supabase(), user_id, movie_id)
 
 
 def _is_fresh(computed_at: str, ttl: timedelta) -> bool:
@@ -278,8 +293,16 @@ def _fetch_credits(movie_ids: list[int]) -> dict[int, dict]:
 
 
 def _upsert_movie_stub(m: dict) -> dict:
-    """Lightweight upsert shape for a TMDB-sourced candidate not already
-    cached — same fallback-stub fields reviews.py's create_review uses."""
+    """Lightweight insert shape for a TMDB-sourced candidate not already
+    cached — same fallback-stub fields reviews.py's create_review uses.
+
+    Always written with ignore_duplicates (INSERT ... ON CONFLICT DO NOTHING).
+    Candidates sourced from the watchlist or a friend's review are built with
+    backdrop_path=None because those code paths never had one to hand, and
+    those films are always already cached — a plain upsert therefore wrote
+    NULL over the real backdrop the media segment had stored, which is how a
+    Pick of the Week ended up with no hero image. A stub exists to guarantee
+    the row is there, not to refresh it."""
     return {
         "id": m["id"],
         "title": m.get("title"),
@@ -320,7 +343,7 @@ def _backfill_items(exclude_ids: set[int], limit: int, supabase) -> list[dict]:
 
     if stubs:
         try:
-            supabase.table("movies").upsert(stubs, on_conflict="id").execute()
+            supabase.table("movies").upsert(stubs, on_conflict="id", ignore_duplicates=True).execute()
         except Exception:
             logger.exception("Failed to upsert backfill movie stubs")
     return items
@@ -675,7 +698,10 @@ def _ensure_watchlist_candidates(candidates: dict[int, dict], signals: UserSigna
     even if TMDB's recommendation/discover calls never happened to surface
     it — force it in as its own candidate so _score_candidates' watchlist
     bonus can apply to it."""
-    missing = [mid for mid in signals.watchlist_ids if mid not in candidates and mid not in signals.reviewed_ids]
+    missing = [
+        mid for mid in signals.watchlist_ids
+        if mid not in candidates and mid not in signals.reviewed_ids and mid not in signals.dismissed_ids
+    ]
     if not missing:
         return
     info = _fetch_credits(missing)
@@ -893,7 +919,7 @@ def _compute(user_id: str, supabase) -> tuple[list[dict], list[dict]]:
     stubs += [_upsert_movie_stub({"id": mid, **c}) for mid, _, c in overflow_candidates if c.get("title")]
     if stubs:
         try:
-            supabase.table("movies").upsert(stubs, on_conflict="id").execute()
+            supabase.table("movies").upsert(stubs, on_conflict="id", ignore_duplicates=True).execute()
         except Exception:
             logger.exception("Failed to upsert recommendation movie stubs")
 
@@ -918,10 +944,13 @@ def _compute_weekly_picks(user_id: str, supabase) -> list[dict]:
     signals = _load_user_signals(user_id, supabase)
 
     if not signals.has_personalization():
-        return _backfill_items(signals.reviewed_ids, 3, supabase)
+        return _backfill_items(signals.reviewed_ids | signals.dismissed_ids, 3, supabase)
 
+    # Dismissed films are excluded here exactly as For You excludes them —
+    # without this, invalidating the picks after a "not interested" would just
+    # recompute the same film straight back into the top three.
     candidates, friend_positive, excluded_ids = _generate_candidates(
-        user_id, supabase, signals, exclude_watchlist=False
+        user_id, supabase, signals, exclude_watchlist=False, extra_excluded_ids=frozenset(signals.dismissed_ids)
     )
     _ensure_watchlist_candidates(candidates, signals)
     if not candidates:
@@ -942,7 +971,7 @@ def _compute_weekly_picks(user_id: str, supabase) -> list[dict]:
     stubs = [_upsert_movie_stub({"id": mid, **c}) for mid, c in top3 if c.get("title")]
     if stubs:
         try:
-            supabase.table("movies").upsert(stubs, on_conflict="id").execute()
+            supabase.table("movies").upsert(stubs, on_conflict="id", ignore_duplicates=True).execute()
         except Exception:
             logger.exception("Failed to upsert weekly-picks movie stubs")
 
