@@ -4,7 +4,7 @@ unlock gate and Redis caching."""
 import logging
 from collections import Counter
 from datetime import datetime, timezone
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from zoneinfo import ZoneInfo
 
 from flask import Blueprint, current_app, jsonify, request
 
@@ -15,6 +15,7 @@ from app.services.supabase_client import get_supabase
 from app.utils.auth import require_auth
 from app.utils.errors import server_error
 from app.utils.social import load_viewable_profile
+from app.utils.tz import parse_tz
 
 logger = logging.getLogger(__name__)
 
@@ -34,13 +35,7 @@ def _parse_tz() -> ZoneInfo | None:
     """The caller's IANA timezone (?tz=Australia/Sydney), used only to bucket
     years / months / streaks in their local time. The Wrapped unlock check
     never uses it (see stats.unlock_status)."""
-    raw = (request.args.get("tz") or "UTC").strip()
-    if not raw or len(raw) > 64:
-        return None
-    try:
-        return ZoneInfo(raw)
-    except (ZoneInfoNotFoundError, ValueError):
-        return None
+    return parse_tz(request.args.get("tz"))
 
 
 def _cache_key(kind: str, user_id: str, tz: ZoneInfo, suffix: str = "") -> str:

@@ -1,3 +1,5 @@
+import logging
+
 from flask import Blueprint, jsonify, request
 
 from app import limiter
@@ -6,9 +8,12 @@ from app.utils.sanitize import sanitize_text
 from app.utils.social import filter_friend_ids, filter_owned_group_ids
 from app.services import tmdb
 from app.services import movie_cache
-from app.services import recommendations
+from app.services import daily_picks, recommendations
 from app.services.supabase_client import get_supabase
 from app.utils.errors import server_error
+from app.utils.tz import parse_tz
+
+logger = logging.getLogger(__name__)
 
 movies_bp = Blueprint("movies", __name__)
 
@@ -75,27 +80,43 @@ def for_you():
         return server_error("Failed to fetch recommendations", exc, 500)
 
 
-@movies_bp.get("/picks-of-the-week")
+@movies_bp.get("/movies-of-the-day")
 @require_auth
-@limiter.limit("10 per minute")
-def picks_of_the_week():
-    """3 hero recommendations — see app.services.recommendations. Refreshed
-    every 7 days; ?force=true bypasses that cache and recomputes immediately."""
+@limiter.limit("20 per minute")
+def movies_of_the_day():
+    """Three picks, new every day in the caller's timezone (?tz=, IANA) —
+    see app.services.daily_picks. ?force=true recomputes today's."""
     user = request.current_user
+    tz = parse_tz(request.args.get("tz"))
+    if tz is None:
+        return jsonify({"error": "Invalid tz"}), 400
     force = request.args.get("force", "").lower() in ("true", "1")
     try:
-        data = recommendations.get_weekly_picks_for_user(str(user.id), force=force)
-        return jsonify(data)
+        return jsonify(daily_picks.get_daily_picks(str(user.id), tz, force=force))
     except Exception as exc:
-        return server_error("Failed to fetch picks of the week", exc, 500)
+        return server_error("Failed to fetch movies of the day", exc, 500)
+
+
+@movies_bp.get("/picks-of-the-week")
+@require_auth
+@limiter.limit("20 per minute")
+def picks_of_the_week():
+    """The old name, kept so a browser still running the pre-rename client
+    keeps working through a deploy. Serves the same daily picks, on UTC days."""
+    user = request.current_user
+    try:
+        return jsonify(daily_picks.get_daily_picks(str(user.id), parse_tz("UTC")))
+    except Exception as exc:
+        return server_error("Failed to fetch movies of the day", exc, 500)
 
 
 @movies_bp.post("/not-interested")
 @require_auth
 @limiter.limit("30 per minute")
 def not_interested():
-    """Dismiss a For You recommendation and splice in a replacement without
-    waiting for the 24h cache refresh."""
+    """Dismiss a recommendation: splice a replacement into For You without
+    waiting for the 24h refresh, and take it out of today's Movies of the
+    Day (the next fetch refills that slot)."""
     user = request.current_user
     body = request.get_json(silent=True) or {}
     movie_id = body.get("movie_id")
@@ -106,9 +127,16 @@ def not_interested():
         return jsonify({"error": "scope must be 'movie' or 'type'"}), 400
     try:
         replacement = recommendations.mark_not_interested(str(user.id), movie_id, scope)
-        return jsonify({"replacement": replacement})
     except Exception as exc:
         return server_error("Failed to mark as not interested", exc, 500)
+    try:
+        daily_dropped = daily_picks.drop_from_daily_picks(get_supabase(), str(user.id), movie_id)
+    except Exception:
+        # The dismissal itself is recorded; the daily picks exclude it from
+        # every future plan regardless.
+        logger.exception("Failed to drop a dismissed film from Movies of the Day")
+        daily_dropped = False
+    return jsonify({"replacement": replacement, "daily_pick_dropped": daily_dropped})
 
 
 @movies_bp.get("/<int:movie_id>")

@@ -392,11 +392,11 @@ def backfill_movie_extras(limit: int | None = None) -> int:
 
 def repair_missing_backdrops() -> tuple[int, int]:
     """Re-fetch every film that's on screen somewhere — a review, a watchlist,
-    a For You feed or this week's picks — but has no backdrop stored.
+    a For You feed or the Movies of the Day — but has no backdrop stored.
 
     Until the stub fix in recommendations._upsert_movie_stub, computing
     recommendations could overwrite a real backdrop with NULL, which left
-    Pick of the Week heroes, For You cards and Wrapped backgrounds blank.
+    Movies of the Day heroes, For You cards and Wrapped backgrounds blank.
     This heals rows written before that fix; a film TMDB genuinely has no
     backdrop for simply stays NULL. Safe to re-run. Returns
     (films missing a backdrop, films refreshed)."""

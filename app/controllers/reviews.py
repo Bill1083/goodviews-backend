@@ -9,7 +9,7 @@ from app.utils.auth import require_auth
 from app.utils.sanitize import sanitize_text
 from app.utils.social import filter_friend_ids, filter_owned_group_ids
 from app.services.supabase_client import get_supabase
-from app.services import cache, movie_cache, recommendations
+from app.services import cache, daily_picks, movie_cache
 from app.utils.errors import server_error
 
 logger = logging.getLogger(__name__)
@@ -158,13 +158,13 @@ def create_review():
         except Exception:
             logger.exception("Failed to invalidate for-you cache after review")
 
-        # If the reviewed movie is one of this week's picks, patch just that
-        # slot out rather than showing an already-watched movie as a "Pick of
-        # the Week" for up to 7 days. Does not trigger a full weekly recompute.
+        # If the reviewed movie is one of today's picks, patch just that
+        # slot out rather than keep showing an already-watched film as a
+        # Movie of the Day; the next fetch refills just that slot.
         try:
-            recommendations.handle_reviewed_movie_for_weekly_picks(str(user.id), movie_id)
+            daily_picks.drop_from_daily_picks(supabase, str(user.id), movie_id)
         except Exception:
-            logger.exception("Failed to patch weekly picks after review")
+            logger.exception("Failed to patch Movies of the Day after review")
 
         # Only fan out to groups the caller actually owns and friends they actually
         # have — otherwise any logged-in user could spam arbitrary users/probe

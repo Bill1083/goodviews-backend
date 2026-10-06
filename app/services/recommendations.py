@@ -1,5 +1,4 @@
 import logging
-import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -12,7 +11,6 @@ from app.services.supabase_client import get_supabase
 logger = logging.getLogger(__name__)
 
 CACHE_TTL = timedelta(hours=24)
-WEEKLY_TTL = timedelta(days=7)
 FEED_SIZE = 24
 MAX_FRIEND_SHARE = 0.15  # friend signal is a light sprinkle, not a major share (confirmed: 10-20% of the feed)
 MAX_GENRE_SHARE = 0.4
@@ -57,15 +55,6 @@ _TYPE_DISLIKE_DIRECTOR_SHARE = 0.5
 _TYPE_DISLIKE_HALF_LIFE_DAYS = 120
 _TYPE_DISLIKE_CAP = 6.0
 
-# Movie Picks of the Week: comparable in scale to _FAVOURITE_BONUS — large
-# enough that a candidate which is both a strong recommendation AND already
-# on the watchlist clearly outranks an equally-scored non-watchlist one,
-# without single-handedly dominating every other signal.
-_WATCHLIST_BONUS = 2.5
-# Scores within this of each other are treated as a near-tie for top-3
-# purposes (roughly one _PROVENANCE_BONUS spread) — see _select_weekly_top3.
-TIE_EPSILON = 0.5
-
 
 def get_recommendations_for_user(user_id: str, force: bool = False) -> dict:
     """Personalized 'For You' feed, cached in user_recommendations for 24h.
@@ -94,41 +83,12 @@ def get_recommendations_for_user(user_id: str, force: bool = False) -> dict:
     return _hydrate(items, supabase)
 
 
-def get_weekly_picks_for_user(user_id: str, force: bool = False) -> dict:
-    """"Movie Picks of the Week" — the user's single best current picks, per
-    the same affinity engine as For You, refreshed every 7 days. Unlike For
-    You, a watchlisted movie isn't excluded from candidacy — it's a bonus
-    signal instead (see _score_candidates' watchlist_bonus): a movie that's
-    both a strong recommendation AND already on the watchlist is a stronger
-    contender, not a filtered-out one."""
-    supabase = get_supabase()
-    row = None
-    if not force:
-        cached = (
-            supabase.table("user_weekly_picks")
-            .select("items, computed_at")
-            .eq("user_id", user_id)
-            .limit(1)
-            .execute()
-        )
-        row = cached.data[0] if cached.data else None
-
-    if row and _is_fresh(row["computed_at"], WEEKLY_TTL):
-        return _hydrate(row["items"], supabase)
-
-    items = _compute_weekly_picks(user_id, supabase)
-    supabase.table("user_weekly_picks").upsert(
-        {"user_id": user_id, "items": items, "computed_at": datetime.now(timezone.utc).isoformat()},
-        on_conflict="user_id",
-    ).execute()
-    return _hydrate(items, supabase)
-
-
 def mark_not_interested(user_id: str, movie_id: int, scope: str = "movie") -> dict | None:
-    """Dismiss a For You recommendation or a Pick of the Week: records it
-    permanently (excluded from all future computes of either), drops it from
-    this week's picks if it is one, and patches the cached For You feed in place
-    (no computed_at bump — this is a splice, not a recompute).
+    """Dismiss a recommendation: records it permanently (excluded from every
+    future For You and Movies of the Day computation) and patches the cached
+    For You feed in place (no computed_at bump — this is a splice, not a
+    recompute). Taking it out of today's Movies of the Day is the route's
+    job (daily_picks.drop_from_daily_picks).
 
     The replacement is drawn from `overflow` — the real scored-but-not-
     selected candidates left over from the last full compute — so a
@@ -152,14 +112,6 @@ def mark_not_interested(user_id: str, movie_id: int, scope: str = "movie") -> di
         },
         on_conflict="user_id,movie_id",
     ).execute()
-
-    # A Pick of the Week can be dismissed too (and may not be in For You at
-    # all), so this runs before the For You patch's early returns. The client
-    # refetches the picks; the recompute excludes the dismissal.
-    try:
-        _drop_from_weekly_picks(supabase, user_id, movie_id)
-    except Exception:
-        logger.exception("Failed to drop dismissed movie from weekly picks")
 
     cached = (
         supabase.table("user_recommendations").select("items, overflow").eq("user_id", user_id).limit(1).execute()
@@ -192,32 +144,6 @@ def mark_not_interested(user_id: str, movie_id: int, scope: str = "movie") -> di
         "user_id", user_id
     ).execute()
     return _hydrate([replacement], supabase)["results"][0] if replacement else None
-
-
-def _drop_from_weekly_picks(supabase, user_id: str, movie_id: int) -> bool:
-    """If the movie is one of this week's picks, delete the cached row so the
-    next fetch does a full real recompute. Returns whether it was a pick."""
-    cached = supabase.table("user_weekly_picks").select("items").eq("user_id", user_id).limit(1).execute()
-    if not cached.data:
-        return False
-    if any(it["movie_id"] == movie_id for it in cached.data[0]["items"] or []):
-        supabase.table("user_weekly_picks").delete().eq("user_id", user_id).execute()
-        return True
-    return False
-
-
-def handle_reviewed_movie_for_weekly_picks(user_id: str, movie_id: int) -> None:
-    """If the just-reviewed movie is one of this week's picks, invalidate the
-    whole cached row (rather than patching just that slot with generic
-    backfill) so the next fetch does a full real recompute — correctly
-    promoting whichever pick is genuinely next-best (e.g. #2 becomes #1)
-    instead of splicing an unranked replacement into the vacated rank.
-    Movie Picks of the Week is cheap enough to recompute in full — candidate
-    generation, not selection, is the expensive part, and it's only a
-    3-item endpoint with its own loading state — that this is simpler than
-    maintaining an overflow pool the way For You's mark_not_interested
-    does."""
-    _drop_from_weekly_picks(get_supabase(), user_id, movie_id)
 
 
 def _is_fresh(computed_at: str, ttl: timedelta) -> bool:
@@ -319,8 +245,8 @@ def _backfill_items(exclude_ids: set[int], limit: int, supabase) -> list[dict]:
     list, minus anything already excluded. Persists stubs so _hydrate can
     find these movies afterward (browsing the plain Top Rated tab never
     writes into the movies table, unlike viewing/reviewing a movie). Also
-    used as the single-replacement picker for mark_not_interested and
-    handle_reviewed_movie_for_weekly_picks (limit=1)."""
+    used as the single-replacement picker for mark_not_interested (limit=1)
+    and as the last resort for Movies of the Day."""
     items: list[dict] = []
     stubs: list[dict] = []
     seen: set[int] = set()
@@ -364,8 +290,8 @@ def _reason_for(provenance: str, top_contributor: tuple[str, str] | None) -> str
 @dataclass
 class UserSignals:
     """Everything derived from a user's own ratings/favourites/onboarding —
-    shared between For You and Movie Picks of the Week so both draw on the
-    same affinity engine instead of two independently-computed ones."""
+    shared between For You and Movies of the Day (app/services/daily_picks.py)
+    so both draw on the same affinity engine."""
 
     reviewed_ids: set[int]
     watchlist_ids: set[int]
@@ -511,12 +437,9 @@ def _generate_candidates(
     exclude_watchlist: bool,
     extra_excluded_ids: frozenset = frozenset(),
 ) -> tuple[dict[int, dict], dict[int, list[tuple[str, float]]], set[int]]:
-    """Candidate generation + friend signal + enrichment, shared by For You
-    (exclude_watchlist=True) and Movie Picks of the Week (exclude_watchlist=
-    False, so a watchlisted movie can still surface — see _score_candidates'
-    watchlist bonus). Returns (candidates, friend_positive, excluded_ids) —
-    callers use excluded_ids for their own backfill call if candidates end up
-    empty, since the two features backfill to different target sizes."""
+    """Candidate generation + friend signal + enrichment for For You. Returns
+    (candidates, friend_positive, excluded_ids) — the caller uses excluded_ids
+    for its own backfill call if candidates end up empty."""
     app = current_app._get_current_object()
     excluded_ids = signals.reviewed_ids | (signals.watchlist_ids if exclude_watchlist else set()) | set(extra_excluded_ids)
 
@@ -693,33 +616,6 @@ def _generate_candidates(
     return candidates, friend_positive, excluded_ids
 
 
-def _ensure_watchlist_candidates(candidates: dict[int, dict], signals: UserSignals) -> None:
-    """Movie Picks of the Week only: a watchlisted movie should be eligible
-    even if TMDB's recommendation/discover calls never happened to surface
-    it — force it in as its own candidate so _score_candidates' watchlist
-    bonus can apply to it."""
-    missing = [
-        mid for mid in signals.watchlist_ids
-        if mid not in candidates and mid not in signals.reviewed_ids and mid not in signals.dismissed_ids
-    ]
-    if not missing:
-        return
-    info = _fetch_credits(missing)
-    for mid, i in info.items():
-        candidates[mid] = {
-            "provenance": "watchlist",
-            "top_contributor": None,
-            "title": i["title"],
-            "poster_path": i["poster_path"],
-            "backdrop_path": None,
-            "release_date": i["release_date"],
-            "vote_average": i["vote_average"],
-            "genre_ids": i["genre_ids"],
-            "person_ids": i["person_ids"],
-            "director_ids": i["director_ids"],
-        }
-
-
 def _type_dislike_penalty(candidate: dict, type_dislikes: list[dict]) -> float:
     """Similarity-weighted penalty from "not interested in these types" dismissals
     (see the _TYPE_DISLIKE_* constants for the rationale). Candidates that were
@@ -742,8 +638,6 @@ def _score_candidates(
     candidates: dict[int, dict],
     signals: UserSignals,
     friend_positive: dict[int, list[tuple[str, float]]],
-    watchlist_bonus_ids: frozenset = frozenset(),
-    watchlist_bonus: float = 0.0,
 ) -> list[tuple[int, float, dict]]:
     scored: list[tuple[int, float, dict]] = []
     for mid, c in candidates.items():
@@ -760,8 +654,6 @@ def _score_candidates(
         if votes:
             avg_friend_rating = sum(v for _, v in votes) / len(votes)
             score += _FRIEND_BOOST_PER_FRIEND * len(votes) + 0.5 * (avg_friend_rating - 3)
-        if mid in watchlist_bonus_ids:
-            score += watchlist_bonus
         score -= _type_dislike_penalty(c, signals.type_dislikes)
         scored.append((mid, score, c))
 
@@ -795,32 +687,6 @@ def _spread_by_reason(items: list[dict]) -> list[dict]:
             if groups[reason]:
                 result.append(groups[reason].pop(0))
     return result
-
-
-def _select_weekly_top3(scored: list[tuple[int, float, dict]], user_id: str, now: datetime) -> list[tuple[int, dict]]:
-    """A clear winner (score gap over the rest exceeds TIE_EPSILON) is a
-    group of size 1 and is picked deterministically every week — it
-    "persists" simply because nothing about the computation changed, no
-    incumbent-tracking required. A near-tie group (size >1) is resolved by a
-    per-(user_id, iso_week)-seeded random choice, so it varies week to week
-    even with unchanged data, while staying stable *within* a given week."""
-    if not scored:
-        return []
-    year, week, _ = now.isocalendar()
-    # Seed must be a plain string, not a tuple containing user_id — Python's
-    # hash() on tuples/strs is subject to per-process PYTHONHASHSEED
-    # randomization, but random.seed() on a str/bytes uses SHA-512
-    # internally and is stable across processes/restarts.
-    rng = random.Random(f"{user_id}:{year}-W{week}")
-    remaining = list(scored)
-    chosen: list[tuple[int, dict]] = []
-    while remaining and len(chosen) < 3:
-        top_score = remaining[0][1]
-        tied = [t for t in remaining if top_score - t[1] <= TIE_EPSILON]
-        pick = rng.choice(tied) if len(tied) > 1 else tied[0]
-        chosen.append((pick[0], pick[2]))
-        remaining = [t for t in remaining if t[0] != pick[0]]
-    return chosen
 
 
 def _compute(user_id: str, supabase) -> tuple[list[dict], list[dict]]:
@@ -938,44 +804,3 @@ def _compute(user_id: str, supabase) -> tuple[list[dict], list[dict]]:
         items += _backfill_items(excluded_ids | chosen_ids, FEED_SIZE - len(items), supabase)
 
     return _spread_by_reason(items), overflow
-
-
-def _compute_weekly_picks(user_id: str, supabase) -> list[dict]:
-    signals = _load_user_signals(user_id, supabase)
-
-    if not signals.has_personalization():
-        return _backfill_items(signals.reviewed_ids | signals.dismissed_ids, 3, supabase)
-
-    # Dismissed films are excluded here exactly as For You excludes them —
-    # without this, invalidating the picks after a "not interested" would just
-    # recompute the same film straight back into the top three.
-    candidates, friend_positive, excluded_ids = _generate_candidates(
-        user_id, supabase, signals, exclude_watchlist=False, extra_excluded_ids=frozenset(signals.dismissed_ids)
-    )
-    _ensure_watchlist_candidates(candidates, signals)
-    if not candidates:
-        return _backfill_items(excluded_ids, 3, supabase)
-
-    scored = _score_candidates(
-        candidates,
-        signals,
-        friend_positive,
-        watchlist_bonus_ids=frozenset(signals.watchlist_ids),
-        watchlist_bonus=_WATCHLIST_BONUS,
-    )
-    if not scored:
-        return _backfill_items(excluded_ids, 3, supabase)
-
-    top3 = _select_weekly_top3(scored, user_id, datetime.now(timezone.utc))
-
-    stubs = [_upsert_movie_stub({"id": mid, **c}) for mid, c in top3 if c.get("title")]
-    if stubs:
-        try:
-            supabase.table("movies").upsert(stubs, on_conflict="id", ignore_duplicates=True).execute()
-        except Exception:
-            logger.exception("Failed to upsert weekly-picks movie stubs")
-
-    items = [{"movie_id": mid, "reason": _reason_for(c["provenance"], c["top_contributor"])} for mid, c in top3]
-    if len(items) < 3:
-        items += _backfill_items(excluded_ids | {it["movie_id"] for it in items}, 3 - len(items), supabase)
-    return items

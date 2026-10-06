@@ -39,6 +39,10 @@ flask --app run.py backfill-movie-extras            # or --limit 200 for an incr
 `sql/009_friends_list_visibility.sql` adds the per-user friends-list switch used by public
 profiles. Reads fall back gracefully without it, but the settings toggle can't save until it's applied.
 
+`sql/010_movies_of_the_day.sql` adds `user_weekly_picks.recent`, the two-week history that stops
+Movies of the Day repeating a film. Safe to apply before or after deploying: without it the picks
+still change every day, but can only avoid repeating the previous day's.
+
 ## Scheduled commands
 
 Run these from cron (they are not triggered by the app itself):
@@ -48,6 +52,7 @@ Run these from cron (they are not triggered by the app itself):
 | `flask --app run.py prune-movies` | weekly | delete unreferenced movie cache rows |
 | `flask --app run.py refresh-stale-movies` | monthly | TMDB terms: refresh cached data older than 150 days |
 | `flask --app run.py backfill-movie-extras` | once after `sql/008` | fill the stats columns for reviewed/watchlisted films |
+| `flask --app run.py repair-missing-backdrops` | once, after deploying the stub fix | re-fetch films whose backdrop the old recommendation stubs blanked |
 
 ## Taste stats + Wrapped
 
