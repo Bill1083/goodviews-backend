@@ -64,6 +64,23 @@ def test_orders_by_curated_keyword_rank_not_tmdb_order(monkeypatch, app_ctx):
     assert [p["provider_id"] for p in result] == [8, 337]
 
 
+def test_excludes_bundle_and_tier_variants_of_a_curated_name(monkeypatch, app_ctx):
+    """A real AU catalog call turned these up: TMDB lists tier variants and
+    channel-bundle listings as their own providers, which a substring match
+    against "netflix"/"apple tv" would wrongly pull in alongside the real
+    thing. Exact-name matching is what keeps them out."""
+    monkeypatch.setattr(tmdb, "get_watch_providers_list", lambda region: {"results": [
+        {"provider_id": 8, "provider_name": "Netflix", "logo_path": "/n.png"},
+        {"provider_id": 175, "provider_name": "Netflix Kids", "logo_path": "/nk.png"},
+        {"provider_id": 1796, "provider_name": "Netflix Standard with Ads", "logo_path": "/na.png"},
+        {"provider_id": 350, "provider_name": "Apple TV", "logo_path": "/a.png"},
+        {"provider_id": 2, "provider_name": "Apple TV Store", "logo_path": "/as.png"},
+        {"provider_id": 1852, "provider_name": "Britbox Apple TV channel", "logo_path": "/bb.png"},
+    ]})
+    result = streaming_picks.list_streaming_providers()
+    assert [p["provider_id"] for p in result] == [8, 350]
+
+
 def test_dedupes_repeated_provider_ids(monkeypatch, app_ctx):
     monkeypatch.setattr(tmdb, "get_watch_providers_list", lambda region: {"results": [
         {"provider_id": 8, "provider_name": "Netflix", "logo_path": "/n.png"},

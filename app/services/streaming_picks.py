@@ -21,21 +21,27 @@ logger = logging.getLogger(__name__)
 # supporting more later is a param, not a redesign.
 REGION = "AU"
 
-# Case-insensitive substring match against TMDB's provider_name, rather than
-# hardcoding provider_ids — those vary by region/time and aren't worth
-# pinning from memory; names are stable and this tolerates TMDB's exact
-# wording changing (e.g. "Amazon Prime Video" still matches "prime video").
-# Order here is the selection grid's display order.
-CURATED_PROVIDER_KEYWORDS = [
+# Exact (case-insensitive) TMDB provider_name matches for the AU catalog —
+# verified against a live call, not guessed from memory. Deliberately *not*
+# a substring match: that pulled in bundle/add-on listings TMDB lists as
+# separate providers ("Britbox Amazon Channel", "AMC Plus Apple TV
+# channel") and alternate ad/kids/basic tiers ("Netflix Standard with
+# Ads") just because they contain a core name — exact names avoid that
+# while still being stable (a core service's TMDB name essentially never
+# changes). Order here is the selection grid's display order.
+#
+# Hayu has no standalone AU entry on TMDB as of this writing, only "Hayu
+# Amazon Channel" (a bundle listing) — left out rather than offered under a
+# confusing name; add it back if TMDB ever lists it standalone.
+CURATED_PROVIDER_NAMES = [
     "netflix",
-    "prime video",
+    "amazon prime video",
     "disney plus",
     "stan",
     "binge",
     "paramount plus",
     "apple tv",
     "foxtel now",
-    "hayu",
     "britbox",
     "crunchyroll",
     "sbs on demand",
@@ -52,11 +58,11 @@ _POOL_SIZE = 24
 
 
 def _rank(provider_name: str) -> int:
-    lowered = provider_name.lower()
-    for i, keyword in enumerate(CURATED_PROVIDER_KEYWORDS):
-        if keyword in lowered:
-            return i
-    return len(CURATED_PROVIDER_KEYWORDS)
+    lowered = provider_name.strip().lower()
+    try:
+        return CURATED_PROVIDER_NAMES.index(lowered)
+    except ValueError:
+        return len(CURATED_PROVIDER_NAMES)
 
 
 def list_streaming_providers() -> list[dict]:
@@ -69,7 +75,7 @@ def list_streaming_providers() -> list[dict]:
     for p in data.get("results", []):
         name = p.get("provider_name", "")
         pid = p.get("provider_id")
-        if pid is None or pid in seen_ids or _rank(name) == len(CURATED_PROVIDER_KEYWORDS):
+        if pid is None or pid in seen_ids or _rank(name) == len(CURATED_PROVIDER_NAMES):
             continue
         seen_ids.add(pid)
         curated.append({"provider_id": pid, "provider_name": name, "logo_path": p.get("logo_path")})
