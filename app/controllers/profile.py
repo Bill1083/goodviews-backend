@@ -17,8 +17,13 @@ VALID_VISIBILITY = ("no_one", "friends_only", "everyone")
 
 # The caller's own row: everything the settings screen can edit.
 SELF_PROFILE_COLUMNS = (
+    "id, username, bio, profile_visibility, avatar_color, avatar_url, avatar_focal_y, avatar_zoom, hide_recent_movies, hide_friends_list, mute_recommendations, mute_friend_requests, has_onboarded, onboarding_genre_ids, seen_tutorials"
+)
+# sql/011 not applied yet
+PRE_TUTORIALS_COLUMNS = (
     "id, username, bio, profile_visibility, avatar_color, avatar_url, avatar_focal_y, avatar_zoom, hide_recent_movies, hide_friends_list, mute_recommendations, mute_friend_requests, has_onboarded, onboarding_genre_ids"
 )
+# sql/009 not applied yet either
 LEGACY_SELF_PROFILE_COLUMNS = (
     "id, username, bio, profile_visibility, avatar_color, avatar_url, avatar_focal_y, avatar_zoom, hide_recent_movies, mute_recommendations, mute_friend_requests, has_onboarded, onboarding_genre_ids"
 )
@@ -48,12 +53,27 @@ def get_profile():
         try:
             result = read(SELF_PROFILE_COLUMNS)
         except Exception as exc:
-            # sql/009 not applied yet — serve the profile without the new flag
-            # rather than breaking every page that reads it.
-            if "hide_friends_list" not in str(exc):
+            # sql/011 (seen_tutorials) or sql/009 (hide_friends_list) not
+            # applied yet — serve the profile without whichever new column is
+            # still missing rather than breaking every page that reads it.
+            if "seen_tutorials" in str(exc):
+                try:
+                    result = read(PRE_TUTORIALS_COLUMNS)
+                except Exception as exc2:
+                    if "hide_friends_list" not in str(exc2):
+                        raise
+                    result = read(LEGACY_SELF_PROFILE_COLUMNS)
+            elif "hide_friends_list" in str(exc):
+                result = read(LEGACY_SELF_PROFILE_COLUMNS)
+            else:
                 raise
-            result = read(LEGACY_SELF_PROFILE_COLUMNS)
-        return jsonify(result.data)
+        data = result.data or {}
+        # Not a DB column — the account's own creation date, straight from the
+        # already-verified auth user, so tutorials can tell "existed before
+        # this feature shipped" apart from "brand new signup" without ever
+        # needing a backfilled column of our own.
+        data["created_at"] = user.created_at.isoformat() if user.created_at else None
+        return jsonify(data)
     except Exception as exc:
         return server_error("Failed to fetch profile", exc, 500)
 
@@ -182,6 +202,32 @@ def update_profile():
 
     if "has_onboarded" in body:
         updates["has_onboarded"] = bool(body["has_onboarded"])
+
+    if "seen_tutorial" in body:
+        key = sanitize_str(body["seen_tutorial"], max_length=100)
+        if not key:
+            return jsonify({"error": "seen_tutorial must be a non-empty string"}), 400
+        # Append-if-absent rather than accepting a full replacement array —
+        # the client only ever has one tutorial key to add at a time, and
+        # this way it doesn't need to fetch-merge-send the whole list itself.
+        try:
+            current = (
+                supabase.table("profiles")
+                .select("seen_tutorials")
+                .eq("id", str(user.id))
+                .single()
+                .execute()
+            ).data.get("seen_tutorials") or []
+        except Exception as exc:
+            # sql/011 not applied yet — no column to append to. Treat as a
+            # no-op rather than a hard failure, since there's nothing to
+            # record and the client doesn't need to do anything differently;
+            # it'll start succeeding once the migration lands.
+            if "seen_tutorials" not in str(exc):
+                return server_error("Failed to update profile", exc, 500)
+            current = None
+        if current is not None and key not in current:
+            updates["seen_tutorials"] = current + [key]
 
     if "onboarding_genre_ids" in body:
         raw_genre_ids = body["onboarding_genre_ids"]
