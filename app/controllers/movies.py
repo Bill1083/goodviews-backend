@@ -221,6 +221,23 @@ def recommend_movie():
         recipient_ids.discard(str(user.id))
 
         if recipient_ids:
+            # Skip anyone who already has an un-dismissed recommendation of
+            # this exact movie from this exact sender — a double-tap (common
+            # on mobile) re-firing this request shouldn't leave two identical
+            # notifications sitting in someone's feed.
+            existing = (
+                supabase.table("notifications")
+                .select("user_id")
+                .eq("sender_id", str(user.id))
+                .eq("movie_id", movie_id)
+                .eq("dismissed", False)
+                .in_("user_id", list(recipient_ids))
+                .execute()
+            )
+            already_notified = {r["user_id"] for r in existing.data}
+            recipient_ids -= already_notified
+
+        if recipient_ids:
             notif_rows = [
                 {
                     "user_id": rid,

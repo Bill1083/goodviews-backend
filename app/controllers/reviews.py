@@ -172,45 +172,39 @@ def create_review():
         allowed_group_ids = filter_owned_group_ids(supabase, str(user.id), group_ids)
         allowed_friend_ids = filter_friend_ids(supabase, str(user.id), friend_ids)
 
-        # Expand group_ids to individual member notifications (same as recommend_movie)
-        all_group_recipient_ids: set[str] = set()
+        # Expand group_ids to individual member user_ids and merge with the
+        # directly-selected friends into ONE recipient set — a friend who is
+        # both picked individually *and* a member of a selected group must
+        # only ever get one notification, not one per source (previously
+        # these were two separate inserts with no dedup between them, so
+        # that exact overlap sent the same recommendation twice).
+        recipient_ids: set[str] = set(allowed_friend_ids)
+        for gid in allowed_group_ids:
+            members = supabase.table("group_members").select("user_id").eq("group_id", gid).execute()
+            for m in members.data:
+                recipient_ids.add(m["user_id"])
+        recipient_ids.discard(str(user.id))
+
+        if recipient_ids and review.get("id"):
+            notif_rows = [
+                {
+                    "user_id": rid,
+                    "sender_id": str(user.id),
+                    "movie_id": movie_id,
+                    "message": "recommended a movie to you",
+                }
+                for rid in recipient_ids
+            ]
+            supabase.table("notifications").insert(notif_rows).execute()
+
+        # Record in group_recommendations for feed tracking (non-fatal if it fails)
         if allowed_group_ids:
-            for gid in allowed_group_ids:
-                members = supabase.table("group_members").select("user_id").eq("group_id", gid).execute()
-                for m in members.data:
-                    all_group_recipient_ids.add(m["user_id"])
-            all_group_recipient_ids.discard(str(user.id))
-            if all_group_recipient_ids:
-                group_notif_rows = [
-                    {
-                        "user_id": rid,
-                        "sender_id": str(user.id),
-                        "movie_id": movie_id,
-                        "message": "recommended a movie to you",
-                    }
-                    for rid in all_group_recipient_ids
-                ]
-                supabase.table("notifications").insert(group_notif_rows).execute()
-            # Record in group_recommendations for feed tracking (non-fatal if it fails)
             try:
                 if review.get("id"):
                     rec_rows = [{"review_id": review["id"], "group_id": gid} for gid in allowed_group_ids]
                     supabase.table("group_recommendations").upsert(rec_rows, on_conflict="review_id,group_id").execute()
             except Exception:
                 pass
-
-        # Record individual friend notifications if provided
-        if allowed_friend_ids and review.get("id"):
-            notif_rows = [
-                {
-                    "user_id": fid,
-                    "sender_id": str(user.id),
-                    "movie_id": movie_id,
-                    "message": "recommended a movie to you",
-                }
-                for fid in allowed_friend_ids
-            ]
-            supabase.table("notifications").insert(notif_rows).execute()
 
         return jsonify(review), 201
     except Exception as exc:
@@ -275,50 +269,43 @@ def update_review(review_id: str):
             review = existing
         cache.invalidate_user_stats(str(user.id))
 
-        # Expand group_ids to individual member notifications — only for groups the
-        # caller actually owns
+        # Expand group_ids to individual member user_ids and merge with the
+        # directly-selected friends into ONE recipient set — see the same
+        # merge in create_review for why (a friend picked directly *and* in
+        # a selected group must only get one notification, not two).
         raw_group_ids = body.get("group_ids") or []
         group_ids = [str(g) for g in raw_group_ids if g] if isinstance(raw_group_ids, list) else []
         allowed_group_ids = filter_owned_group_ids(supabase, str(user.id), group_ids)
+
+        raw_friend_ids = body.get("friend_ids") or []
+        friend_ids = [str(f) for f in raw_friend_ids if f] if isinstance(raw_friend_ids, list) else []
+        allowed_friend_ids = filter_friend_ids(supabase, str(user.id), friend_ids)
+
+        recipient_ids: set[str] = set(allowed_friend_ids)
+        for gid in allowed_group_ids:
+            members = supabase.table("group_members").select("user_id").eq("group_id", gid).execute()
+            for m in members.data:
+                recipient_ids.add(m["user_id"])
+        recipient_ids.discard(str(user.id))
+
+        if recipient_ids:
+            notif_rows = [
+                {
+                    "user_id": rid,
+                    "sender_id": str(user.id),
+                    "movie_id": existing["movie_id"],
+                    "message": "recommended a movie to you",
+                }
+                for rid in recipient_ids
+            ]
+            supabase.table("notifications").insert(notif_rows).execute()
+
         if allowed_group_ids:
-            group_recipient_ids: set[str] = set()
-            for gid in allowed_group_ids:
-                members = supabase.table("group_members").select("user_id").eq("group_id", gid).execute()
-                for m in members.data:
-                    group_recipient_ids.add(m["user_id"])
-            group_recipient_ids.discard(str(user.id))
-            if group_recipient_ids:
-                group_notif_rows = [
-                    {
-                        "user_id": rid,
-                        "sender_id": str(user.id),
-                        "movie_id": existing["movie_id"],
-                        "message": "recommended a movie to you",
-                    }
-                    for rid in group_recipient_ids
-                ]
-                supabase.table("notifications").insert(group_notif_rows).execute()
             try:
                 rec_rows = [{"review_id": review_id, "group_id": gid} for gid in allowed_group_ids]
                 supabase.table("group_recommendations").upsert(rec_rows, on_conflict="review_id,group_id").execute()
             except Exception:
                 pass
-
-        # Send individual friend notifications — only to friends the caller actually has
-        raw_friend_ids = body.get("friend_ids") or []
-        friend_ids = [str(f) for f in raw_friend_ids if f] if isinstance(raw_friend_ids, list) else []
-        allowed_friend_ids = filter_friend_ids(supabase, str(user.id), friend_ids)
-        if allowed_friend_ids:
-            notif_rows = [
-                {
-                    "user_id": fid,
-                    "sender_id": str(user.id),
-                    "movie_id": existing["movie_id"],
-                    "message": "recommended a movie to you",
-                }
-                for fid in allowed_friend_ids
-            ]
-            supabase.table("notifications").insert(notif_rows).execute()
 
         return jsonify(review), 200
     except Exception as exc:
