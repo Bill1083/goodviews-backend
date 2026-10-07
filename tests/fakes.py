@@ -45,6 +45,10 @@ class FakeQuery:
         return self
 
     # ── writes ───────────────────────────────────────────────────────────────
+    def insert(self, payload, **kwargs):
+        self.op, self.payload, self.kwargs = "insert", payload, kwargs
+        return self
+
     def upsert(self, payload, **kwargs):
         self.op, self.payload, self.kwargs = "upsert", payload, kwargs
         return self
@@ -98,6 +102,19 @@ class FakeQuery:
                     r.update(self.payload)
             return FakeResult([])
 
+        if self.op == "insert":
+            payload = self.payload if isinstance(self.payload, list) else [self.payload]
+            for item in payload:
+                self._check_columns(item)
+            defaults = self.db.insert_defaults.get(self.table, {})
+            inserted = []
+            for item in payload:
+                row = {**defaults, **item}
+                row.setdefault("id", f"{self.table}-{len(rows) + len(inserted) + 1}")
+                rows.append(row)
+                inserted.append(row)
+            return FakeResult(inserted)
+
         # upsert
         payload = self.payload if isinstance(self.payload, list) else [self.payload]
         for item in payload:
@@ -113,9 +130,13 @@ class FakeQuery:
 
 
 class FakeSupabase:
-    def __init__(self, tables=None, missing_columns=None):
+    def __init__(self, tables=None, missing_columns=None, insert_defaults=None):
         self.tables = tables if tables is not None else {}
         self.missing_columns = missing_columns or {}
+        # Column defaults a real Postgres table would apply on INSERT that
+        # the application code never sets explicitly (e.g. notifications.
+        # dismissed defaults to false at the DB level) — {table: {col: val}}.
+        self.insert_defaults = insert_defaults or {}
         self.log: list[tuple] = []
 
     def table(self, name: str) -> FakeQuery:
