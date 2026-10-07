@@ -15,18 +15,22 @@ profile_bp = Blueprint("profile", __name__)
 
 VALID_VISIBILITY = ("no_one", "friends_only", "everyone")
 
-# The caller's own row: everything the settings screen can edit.
-SELF_PROFILE_COLUMNS = (
-    "id, username, bio, profile_visibility, avatar_color, avatar_url, avatar_focal_y, avatar_zoom, hide_recent_movies, hide_friends_list, mute_recommendations, mute_friend_requests, has_onboarded, onboarding_genre_ids, seen_tutorials"
+# The caller's own row: everything the settings screen can edit. The three
+# trailing columns were each added after the initial release, behind their
+# own migration (sql/009, 011, 012) — get_profile() below drops whichever of
+# these a request says is still missing and retries, so a deploy can land
+# ahead of its own migration without breaking every page that reads a
+# profile, rather than needing an ever-deeper fallback chain per column.
+BASE_SELF_PROFILE_COLUMNS = (
+    "id, username, bio, profile_visibility, avatar_color, avatar_url, avatar_focal_y, avatar_zoom, "
+    "hide_recent_movies, mute_recommendations, mute_friend_requests, has_onboarded, onboarding_genre_ids"
 )
-# sql/011 not applied yet
-PRE_TUTORIALS_COLUMNS = (
-    "id, username, bio, profile_visibility, avatar_color, avatar_url, avatar_focal_y, avatar_zoom, hide_recent_movies, hide_friends_list, mute_recommendations, mute_friend_requests, has_onboarded, onboarding_genre_ids"
-)
-# sql/009 not applied yet either
-LEGACY_SELF_PROFILE_COLUMNS = (
-    "id, username, bio, profile_visibility, avatar_color, avatar_url, avatar_focal_y, avatar_zoom, hide_recent_movies, mute_recommendations, mute_friend_requests, has_onboarded, onboarding_genre_ids"
-)
+OPTIONAL_SELF_PROFILE_COLUMNS = ("hide_friends_list", "seen_tutorials", "streaming_provider_ids")
+
+
+def _self_profile_columns(missing: set[str] = frozenset()) -> str:
+    extra = [c for c in OPTIONAL_SELF_PROFILE_COLUMNS if c not in missing]
+    return BASE_SELF_PROFILE_COLUMNS + (", " + ", ".join(extra) if extra else "")
 
 # Avatars are picked from TMDB movie-poster art (see AvatarPicker on the client) rather than
 # uploaded, so we only ever need to accept TMDB's own image URLs here.
@@ -40,42 +44,34 @@ def get_profile():
     user = request.current_user
     supabase = get_supabase()
 
-    def read(columns: str):
-        return (
-            supabase.table("profiles")
-            .select(columns)
-            .eq("id", str(user.id))
-            .single()
-            .execute()
-        )
-
-    try:
+    missing: set[str] = set()
+    result = None
+    for _ in range(len(OPTIONAL_SELF_PROFILE_COLUMNS) + 1):
         try:
-            result = read(SELF_PROFILE_COLUMNS)
+            result = (
+                supabase.table("profiles")
+                .select(_self_profile_columns(missing))
+                .eq("id", str(user.id))
+                .single()
+                .execute()
+            )
+            break
         except Exception as exc:
-            # sql/011 (seen_tutorials) or sql/009 (hide_friends_list) not
-            # applied yet — serve the profile without whichever new column is
-            # still missing rather than breaking every page that reads it.
-            if "seen_tutorials" in str(exc):
-                try:
-                    result = read(PRE_TUTORIALS_COLUMNS)
-                except Exception as exc2:
-                    if "hide_friends_list" not in str(exc2):
-                        raise
-                    result = read(LEGACY_SELF_PROFILE_COLUMNS)
-            elif "hide_friends_list" in str(exc):
-                result = read(LEGACY_SELF_PROFILE_COLUMNS)
-            else:
-                raise
-        data = result.data or {}
-        # Not a DB column — the account's own creation date, straight from the
-        # already-verified auth user, so tutorials can tell "existed before
-        # this feature shipped" apart from "brand new signup" without ever
-        # needing a backfilled column of our own.
-        data["created_at"] = user.created_at.isoformat() if user.created_at else None
-        return jsonify(data)
-    except Exception as exc:
-        return server_error("Failed to fetch profile", exc, 500)
+            newly_missing = next((c for c in OPTIONAL_SELF_PROFILE_COLUMNS if c not in missing and c in str(exc)), None)
+            if not newly_missing:
+                return server_error("Failed to fetch profile", exc, 500)
+            missing.add(newly_missing)
+
+    if result is None:
+        return server_error("Failed to fetch profile", RuntimeError("could not resolve profile columns"), 500)
+
+    data = result.data or {}
+    # Not a DB column — the account's own creation date, straight from the
+    # already-verified auth user, so tutorials can tell "existed before
+    # this feature shipped" apart from "brand new signup" without ever
+    # needing a backfilled column of our own.
+    data["created_at"] = user.created_at.isoformat() if user.created_at else None
+    return jsonify(data)
 
 
 @profile_bp.get("/<user_id>")
@@ -240,6 +236,21 @@ def update_profile():
         if any(g not in GENRE_MAP for g in genre_ids):
             return jsonify({"error": "Invalid genre id in onboarding_genre_ids"}), 400
         updates["onboarding_genre_ids"] = genre_ids
+
+    if "streaming_provider_ids" in body:
+        raw_provider_ids = body["streaming_provider_ids"]
+        if not isinstance(raw_provider_ids, list):
+            return jsonify({"error": "streaming_provider_ids must be a list"}), 400
+        try:
+            provider_ids = [int(p) for p in raw_provider_ids]
+        except (TypeError, ValueError):
+            return jsonify({"error": "streaming_provider_ids must be integers"}), 400
+        # Not checked against the live curated list (that's a TMDB round-trip
+        # streaming_picks.list_streaming_providers() already caches, not
+        # worth repeating on every save) — just sane, bounded TMDB-style ids.
+        if any(not (0 < p < 100_000) for p in provider_ids):
+            return jsonify({"error": "Invalid provider id in streaming_provider_ids"}), 400
+        updates["streaming_provider_ids"] = provider_ids
 
     if not updates:
         return jsonify({"error": "No valid fields provided"}), 400

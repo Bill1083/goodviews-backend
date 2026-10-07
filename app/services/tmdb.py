@@ -201,8 +201,24 @@ def get_similar_movies(movie_id: int, page: int = 1) -> dict:
 def discover_movies(params: dict) -> dict:
     """Thin passthrough to TMDB's /discover/movie — used to generate
     candidates from a favourite actor/director (with_cast/with_crew) rather
-    than from a specific seed movie."""
+    than from a specific seed movie, and (with_watch_providers/watch_region)
+    for the "Your Streaming Services" carousel."""
     return _tmdb_get("/discover/movie", params)
+
+
+def get_watch_providers_list(region: str) -> dict:
+    """Every provider TMDB/JustWatch knows about for a region — the catalog
+    list, not any one movie's availability. Cached a long time (config
+    STREAMING_PROVIDERS_TTL_HOURS): this barely changes from one week to the
+    next, unlike per-movie availability."""
+    cache_key = f"tmdb:watch_providers:movie:{region}"
+    cached = _cache_get(cache_key)
+    if cached:
+        return cached
+    data = _tmdb_get("/watch/providers/movie", {"watch_region": region})
+    ttl = current_app.config["STREAMING_PROVIDERS_TTL_HOURS"] * 3600
+    _cache_set(cache_key, data, ttl=ttl)
+    return data
 
 
 def search_people(query: str, page: int = 1) -> dict:

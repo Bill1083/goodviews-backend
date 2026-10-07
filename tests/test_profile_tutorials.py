@@ -12,6 +12,7 @@ import pytest
 from app import create_app
 from app.controllers import profile as profile_controller
 from app.utils import auth as auth_utils
+from tests.fakes import FakeProfileTable
 
 ME = "me-id"
 CREATED_AT = datetime(2025, 1, 1, tzinfo=timezone.utc)
@@ -32,50 +33,10 @@ BASE_ROW = {
     "has_onboarded": True,
     "onboarding_genre_ids": [],
     "seen_tutorials": [],
+    "streaming_provider_ids": [],
 }
 
 AUTH = {"Authorization": "Bearer good"}
-
-
-class FakeProfileTable:
-    """Just enough of the fluent PostgREST builder for profile.py's self
-    routes: select/update + eq/single + execute. `missing` simulates a
-    column sql/011 hasn't added yet by raising the same shape of error
-    Postgres gives for an unknown column."""
-
-    def __init__(self, row: dict, missing: set[str] = frozenset()):
-        self.row = dict(row)
-        self.missing = missing
-        self._cols: list[str] | None = None
-        self._single = False
-        self._update_values: dict | None = None
-
-    def select(self, cols: str, **_kw):
-        self._cols = [c.strip() for c in cols.split(",")]
-        self._update_values = None
-        return self
-
-    def update(self, values: dict):
-        self._update_values = values
-        self._cols = None
-        return self
-
-    def eq(self, _col, _val):
-        return self
-
-    def single(self):
-        self._single = True
-        return self
-
-    def execute(self):
-        if self._update_values is not None:
-            self.row.update(self._update_values)
-            return SimpleNamespace(data=[dict(self.row)])
-        missing = [c for c in (self._cols or []) if c in self.missing]
-        if missing:
-            raise RuntimeError(f"column profiles.{missing[0]} does not exist")
-        projected = {c: self.row.get(c) for c in (self._cols or [])}
-        return SimpleNamespace(data=projected if self._single else [projected])
 
 
 @pytest.fixture

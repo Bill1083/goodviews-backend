@@ -17,6 +17,14 @@ class Config:
     MOVIE_MEDIA_TTL_DAYS = int(os.getenv("MOVIE_MEDIA_TTL_DAYS", 10))            # posters/trailers: 7-14d
     MOVIE_PROVIDERS_TTL_HOURS = int(os.getenv("MOVIE_PROVIDERS_TTL_HOURS", 24))  # watch providers: 24-48h
 
+    # "Your Streaming Services" carousel — how long a TMDB /discover/movie
+    # pool for a given provider-id set stays cached (shared across every user
+    # with that same selection, not per-user — see app/services/streaming_picks.py).
+    STREAMING_PICKS_TTL_HOURS = int(os.getenv("STREAMING_PICKS_TTL_HOURS", 12))
+    # How long the curated streaming-provider list itself (names/logos/ids)
+    # is cached — this changes rarely, so a long TTL is fine.
+    STREAMING_PROVIDERS_TTL_HOURS = int(os.getenv("STREAMING_PROVIDERS_TTL_HOURS", 24 * 7))
+
     # Prune movies not viewed in this many days (and not referenced by any
     # watchlist/review/notification) to keep the DB from growing forever.
     MOVIE_PRUNE_AFTER_DAYS = int(os.getenv("MOVIE_PRUNE_AFTER_DAYS", 90))

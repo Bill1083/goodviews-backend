@@ -8,7 +8,7 @@ from app.utils.sanitize import sanitize_text
 from app.utils.social import filter_friend_ids, filter_owned_group_ids
 from app.services import tmdb
 from app.services import movie_cache
-from app.services import daily_picks, recommendations
+from app.services import daily_picks, recommendations, streaming_picks
 from app.services.supabase_client import get_supabase
 from app.utils.errors import server_error
 from app.utils.tz import parse_tz
@@ -108,6 +108,63 @@ def picks_of_the_week():
         return jsonify(daily_picks.get_daily_picks(str(user.id), parse_tz("UTC")))
     except Exception as exc:
         return server_error("Failed to fetch movies of the day", exc, 500)
+
+
+@movies_bp.get("/streaming-providers")
+@limiter.limit("30 per minute")
+def streaming_providers():
+    """The curated streaming-provider picker list for Settings — not
+    user-specific, so no auth needed."""
+    try:
+        return jsonify(streaming_picks.list_streaming_providers())
+    except Exception as exc:
+        return server_error("Failed to fetch streaming providers", exc, 502)
+
+
+@movies_bp.get("/streaming-picks")
+@require_auth
+@limiter.limit("20 per minute")
+def streaming_picks_route():
+    """"Your Streaming Services": popular/well-rated/genre-affinity films
+    available on the providers this user selected in Settings.
+    ?exclude_seen=true drops anything they've already reviewed."""
+    user = request.current_user
+    supabase = get_supabase()
+    exclude_seen = request.args.get("exclude_seen", "").lower() in ("true", "1")
+
+    try:
+        profile_result = (
+            supabase.table("profiles")
+            .select("streaming_provider_ids, onboarding_genre_ids")
+            .eq("id", str(user.id))
+            .single()
+            .execute()
+        )
+        row = profile_result.data or {}
+    except Exception as exc:
+        # sql/012 not applied yet — no provider ids to read, so there's
+        # nothing to show rather than a hard failure.
+        if "streaming_provider_ids" not in str(exc):
+            return server_error("Failed to fetch streaming picks", exc, 500)
+        row = {}
+
+    provider_ids = row.get("streaming_provider_ids") or []
+    genre_ids = row.get("onboarding_genre_ids") or []
+
+    try:
+        exclude_ids: set[int] = set()
+        if exclude_seen and provider_ids:
+            reviewed = (
+                supabase.table("reviews")
+                .select("movie_id")
+                .eq("user_id", str(user.id))
+                .execute()
+            )
+            exclude_ids = {r["movie_id"] for r in reviewed.data}
+        results = streaming_picks.get_streaming_picks(provider_ids, genre_ids, exclude_ids)
+        return jsonify({"results": results})
+    except Exception as exc:
+        return server_error("Failed to fetch streaming picks", exc, 500)
 
 
 @movies_bp.post("/not-interested")

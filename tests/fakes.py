@@ -144,3 +144,46 @@ class FakeSupabase:
 
     def writes(self, op: str, table: str) -> list[tuple]:
         return [entry for entry in self.log if entry[0] == op and entry[1] == table]
+
+
+class FakeProfileTable:
+    """A single profile row's worth of the fluent PostgREST builder:
+    select/update + eq/single + execute. `missing` simulates a column a
+    migration hasn't added yet by raising the same shape of error Postgres
+    gives for an unknown column — used by profile.py's self-route tests to
+    exercise its "drop whichever optional column is still missing and
+    retry" fallback."""
+
+    def __init__(self, row: dict, missing: set[str] = frozenset()):
+        self.row = dict(row)
+        self.missing = missing
+        self._cols: list[str] | None = None
+        self._single = False
+        self._update_values: dict | None = None
+
+    def select(self, cols: str, **_kw):
+        self._cols = [c.strip() for c in cols.split(",")]
+        self._update_values = None
+        return self
+
+    def update(self, values: dict):
+        self._update_values = values
+        self._cols = None
+        return self
+
+    def eq(self, _col, _val):
+        return self
+
+    def single(self):
+        self._single = True
+        return self
+
+    def execute(self):
+        if self._update_values is not None:
+            self.row.update(self._update_values)
+            return FakeResult([dict(self.row)])
+        missing = [c for c in (self._cols or []) if c in self.missing]
+        if missing:
+            raise RuntimeError(f"column profiles.{missing[0]} does not exist")
+        projected = {c: self.row.get(c) for c in (self._cols or [])}
+        return FakeResult(projected if self._single else [projected])
