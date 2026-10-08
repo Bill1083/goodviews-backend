@@ -1,18 +1,16 @@
 """Backs two things: the curated streaming-provider picker in Settings, and
-the "Your Streaming Services" Discover carousel — popular/well-rated/genre-
-affinity films, filtered to only what's actually available (flatrate, i.e.
-subscription-included) on the providers a user says they have. Deliberately
-sourced from TMDB's evergreen catalog (popularity/vote_average/genre), not
-now_playing/upcoming — this carousel is "what can I watch tonight", not new
-releases (that's Movies of the Day).
+the "Only show what I can stream" filter applied to For You and Movies of
+the Day — NOT to Most Popular This Week, which stays unfiltered on purpose
+(it's current/trending titles, including ones still only in cinemas, so
+"is this on your streaming services" doesn't apply to it the way it does to
+the personalized/evergreen feeds).
 """
 import logging
-import random
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from flask import current_app
 
-from app.services import tmdb
-from app.services.cache import cache_get, cache_set
+from app.services import movie_cache, tmdb
 
 logger = logging.getLogger(__name__)
 
@@ -47,15 +45,6 @@ CURATED_PROVIDER_NAMES = [
     "sbs on demand",
 ]
 
-_MOVIE_FIELDS = ("id", "title", "poster_path", "backdrop_path", "release_date", "overview", "vote_average", "genre_ids")
-
-# How many TMDB discover pages deep a "popular" pool call picks from —
-# re-rolled each time the pool's cache entry expires, so the carousel
-# doesn't show the literal same top-20-popular set forever.
-_RANDOM_POOL_PAGES = 5
-
-_POOL_SIZE = 24
-
 
 def _rank(provider_name: str) -> int:
     lowered = provider_name.strip().lower()
@@ -83,77 +72,42 @@ def list_streaming_providers() -> list[dict]:
     return curated
 
 
-def _slim(movie: dict) -> dict:
-    return {field: movie.get(field) for field in _MOVIE_FIELDS}
+def _available_on(movie_id: int, provider_ids: set[int], app) -> bool:
+    """Flatrate (subscription-included, not rent/buy) availability for one
+    movie against the given provider ids, via the same per-movie TMDB
+    watch-providers cache MovieDetailModal's "where to watch" already uses
+    (movie_cache's "providers" segment — a Postgres read on any cache hit,
+    which is the overwhelming majority of calls once a movie's been looked
+    at once). Fails open (keeps the movie) on any lookup error — a provider
+    lookup hiccup should never be why a film silently vanishes from a feed."""
+    with app.app_context():
+        try:
+            data = movie_cache.get_movie(movie_id, segments=("providers",))
+        except Exception:
+            logger.exception("Streaming-filter provider lookup failed for movie %s", movie_id)
+            return True
+    region_data = (data.get("watch/providers") or {}).get("results", {}).get(REGION) or {}
+    flatrate = region_data.get("flatrate") or []
+    return any(p.get("provider_id") in provider_ids for p in flatrate)
 
 
-def _discover_pool(provider_ids: list[int], extra_params: dict, cache_suffix: str) -> list[dict]:
-    """One TMDB /discover/movie page, filtered to the given providers —
-    cached and shared across every user with this exact provider selection
-    (keyed by the provider set, not by user), since the underlying catalog
-    is the same for everyone with the same services."""
-    provider_key = ",".join(str(p) for p in sorted(provider_ids))
-    cache_key = f"streaming_picks:{provider_key}:{cache_suffix}"
-    cached = cache_get(cache_key)
-    if cached is not None:
-        return cached
+def filter_by_availability(movies: list[dict], provider_ids: list[int]) -> list[dict]:
+    """Keeps only movies available (flatrate) on at least one of provider_ids,
+    preserving the input order. A no-op if provider_ids is empty — filtering
+    "my streaming services" down to zero services isn't "show nothing", it's
+    "there's nothing to filter by", same as the toggle being off.
 
-    params = {
-        "watch_region": REGION,
-        "with_watch_providers": "|".join(str(p) for p in provider_ids),
-        "with_watch_monetization_types": "flatrate",
-        "include_adult": "false",
-        **extra_params,
-    }
-    try:
-        data = tmdb.discover_movies(params)
-    except Exception:
-        logger.exception("Streaming-picks discover call failed (%s)", cache_suffix)
-        return []
+    Looks up every movie in parallel (same reasoning/pattern as reviews.py's
+    _enrich_movies: movie_cache.get_movie needs current_app, which a
+    ThreadPoolExecutor worker doesn't inherit on its own) — a feed is at
+    most ~20 films, and almost every lookup is a cached Postgres read, but a
+    fully cold cache doing them one at a time would otherwise add up."""
+    if not provider_ids or not movies:
+        return movies
 
-    results = [_slim(m) for m in data.get("results", [])]
-    ttl = current_app.config["STREAMING_PICKS_TTL_HOURS"] * 3600
-    cache_set(cache_key, results, ttl=ttl)
-    return results
-
-
-def get_streaming_picks(provider_ids: list[int], genre_ids: list[int], exclude_movie_ids: set[int]) -> list[dict]:
-    """Popular + well-rated + (if the user has onboarding genre picks)
-    genre-affinity pools, filtered to the given providers, merged and
-    interleaved so no single pool dominates the front of the carousel.
-    exclude_movie_ids is the "hide films I've already seen" toggle's effect
-    — the caller decides what that set is (here: the user's reviewed
-    movie_ids) so this function stays about pool-building, not DB access."""
-    if not provider_ids:
-        return []
-
-    popular_page = random.randint(1, _RANDOM_POOL_PAGES)
-    popular = _discover_pool(
-        provider_ids, {"sort_by": "popularity.desc", "page": popular_page}, f"popular:{popular_page}",
-    )
-    top_rated = _discover_pool(
-        provider_ids, {"sort_by": "vote_average.desc", "vote_count.gte": 200}, "top_rated",
-    )
-    for_you: list[dict] = []
-    if genre_ids:
-        genre_key = ",".join(str(g) for g in sorted(genre_ids))
-        for_you = _discover_pool(
-            provider_ids, {"sort_by": "popularity.desc", "with_genres": genre_key}, f"for_you:{genre_key}",
-        )
-
-    pools = [p for p in (for_you, popular, top_rated) if p]
-    merged: list[dict] = []
-    seen_ids: set[int] = set(exclude_movie_ids)
-    idx = 0
-    while len(merged) < _POOL_SIZE and any(idx < len(p) for p in pools):
-        for p in pools:
-            if idx >= len(p):
-                continue
-            m = p[idx]
-            if m["id"] in seen_ids:
-                continue
-            seen_ids.add(m["id"])
-            merged.append(m)
-        idx += 1
-
-    return merged[:_POOL_SIZE]
+    ids = set(provider_ids)
+    app = current_app._get_current_object()
+    with ThreadPoolExecutor(max_workers=min(len(movies), 10)) as executor:
+        futures = {executor.submit(_available_on, m["id"], ids, app): m["id"] for m in movies}
+        keep_ids = {futures[f] for f in as_completed(futures) if f.result()}
+    return [m for m in movies if m["id"] in keep_ids]

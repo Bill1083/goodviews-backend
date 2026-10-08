@@ -1,42 +1,28 @@
-"""The "Your Streaming Services" pipeline: picking a curated provider list
-out of TMDB's full catalog, and merging popular/well-rated/genre-affinity
-discover pools into one carousel's worth of candidates."""
+"""Curating TMDB's AU provider catalog down to recognizable names, and
+filtering a feed to only films available (flatrate) on a given provider set."""
 import pytest
 
 from app import create_app
-from app.services import streaming_picks, tmdb
+from app.services import movie_cache, streaming_picks, tmdb
 
 
 def movie(id_, **over):
-    base = {"id": id_, "title": f"Movie {id_}", "poster_path": None, "backdrop_path": None,
-            "release_date": "2020-01-01", "overview": "", "vote_average": 7.0, "genre_ids": [28]}
+    base = {"id": id_, "title": f"Movie {id_}", "poster_path": None}
     base.update(over)
     return base
 
 
-class FakeCache:
-    def __init__(self):
-        self.store: dict = {}
-
-    def get(self, key):
-        return self.store.get(key)
-
-    def set(self, key, value, ttl=None):
-        self.store[key] = value
+def providers_payload(region_flatrate: dict[int, list[int]] | None = None):
+    """A movie_cache.get_movie()-shaped response with watch/providers for AU,
+    where region_flatrate maps provider_id -> itself (just need the ids)."""
+    flatrate = [{"provider_id": pid} for pid in (region_flatrate or [])]
+    return {"watch/providers": {"results": {"AU": {"flatrate": flatrate}}}}
 
 
 @pytest.fixture
 def app_ctx():
     with create_app().app_context():
         yield
-
-
-@pytest.fixture
-def fake_cache(monkeypatch):
-    cache = FakeCache()
-    monkeypatch.setattr(streaming_picks, "cache_get", cache.get)
-    monkeypatch.setattr(streaming_picks, "cache_set", cache.set)
-    return cache
 
 
 # ─── list_streaming_providers ────────────────────────────────────────────────
@@ -51,17 +37,6 @@ def test_keeps_only_curated_providers(monkeypatch, app_ctx):
     ids = [p["provider_id"] for p in result]
     assert 8 in ids and 337 in ids
     assert 999 not in ids
-
-
-def test_orders_by_curated_keyword_rank_not_tmdb_order(monkeypatch, app_ctx):
-    # Disney Plus listed first by TMDB, but netflix ranks earlier in
-    # CURATED_PROVIDER_KEYWORDS — the curated order should win.
-    monkeypatch.setattr(tmdb, "get_watch_providers_list", lambda region: {"results": [
-        {"provider_id": 337, "provider_name": "Disney Plus", "logo_path": "/d.png"},
-        {"provider_id": 8, "provider_name": "Netflix", "logo_path": "/n.png"},
-    ]})
-    result = streaming_picks.list_streaming_providers()
-    assert [p["provider_id"] for p in result] == [8, 337]
 
 
 def test_excludes_bundle_and_tier_variants_of_a_curated_name(monkeypatch, app_ctx):
@@ -81,55 +56,63 @@ def test_excludes_bundle_and_tier_variants_of_a_curated_name(monkeypatch, app_ct
     assert [p["provider_id"] for p in result] == [8, 350]
 
 
+def test_orders_by_curated_rank_not_tmdb_order(monkeypatch, app_ctx):
+    monkeypatch.setattr(tmdb, "get_watch_providers_list", lambda region: {"results": [
+        {"provider_id": 337, "provider_name": "Disney Plus", "logo_path": "/d.png"},
+        {"provider_id": 8, "provider_name": "Netflix", "logo_path": "/n.png"},
+    ]})
+    result = streaming_picks.list_streaming_providers()
+    assert [p["provider_id"] for p in result] == [8, 337]
+
+
 def test_dedupes_repeated_provider_ids(monkeypatch, app_ctx):
     monkeypatch.setattr(tmdb, "get_watch_providers_list", lambda region: {"results": [
         {"provider_id": 8, "provider_name": "Netflix", "logo_path": "/n.png"},
         {"provider_id": 8, "provider_name": "Netflix Standard with Ads", "logo_path": "/n2.png"},
     ]})
-    result = streaming_picks.list_streaming_providers()
-    assert len(result) == 1
+    assert len(streaming_picks.list_streaming_providers()) == 1
 
 
-# ─── get_streaming_picks ─────────────────────────────────────────────────────
+# ─── filter_by_availability ──────────────────────────────────────────────────
 
-def test_no_providers_selected_returns_nothing(app_ctx):
-    assert streaming_picks.get_streaming_picks([], [], set()) == []
-
-
-def test_merges_and_dedupes_across_pools(monkeypatch, app_ctx, fake_cache):
-    def fake_discover(params):
-        if params.get("with_genres"):
-            return {"results": [movie(1), movie(2)]}
-        if params.get("sort_by") == "vote_average.desc":
-            return {"results": [movie(2), movie(3)]}  # 2 overlaps the genre pool
-        return {"results": [movie(4), movie(5)]}  # popularity pool
-
-    monkeypatch.setattr(tmdb, "discover_movies", fake_discover)
-    results = streaming_picks.get_streaming_picks([8], [28], set())
-    ids = [m["id"] for m in results]
-    assert len(ids) == len(set(ids))  # no duplicate despite movie 2 appearing twice
-    assert {1, 2, 3, 4, 5} <= set(ids)
+def test_empty_provider_ids_is_a_no_op(app_ctx):
+    movies = [movie(1), movie(2)]
+    assert streaming_picks.filter_by_availability(movies, []) == movies
 
 
-def test_excludes_already_seen_movie_ids(monkeypatch, app_ctx, fake_cache):
-    monkeypatch.setattr(tmdb, "discover_movies", lambda params: {"results": [movie(1), movie(2), movie(3)]})
-    results = streaming_picks.get_streaming_picks([8], [], {2})
-    ids = {m["id"] for m in results}
-    assert 2 not in ids
-    assert {1, 3} <= ids
+def test_empty_movie_list_is_a_no_op(app_ctx):
+    assert streaming_picks.filter_by_availability([], [8]) == []
 
 
-def test_discover_pool_is_cached_across_calls_with_the_same_providers(monkeypatch, app_ctx, fake_cache):
-    calls = []
+def test_keeps_only_movies_available_on_a_selected_provider(monkeypatch, app_ctx):
+    data = {1: providers_payload({8: None}), 2: providers_payload({337: None}), 3: providers_payload({})}
+    monkeypatch.setattr(movie_cache, "get_movie", lambda movie_id, segments=(): data[movie_id])
+    result = streaming_picks.filter_by_availability([movie(1), movie(2), movie(3)], [8])
+    assert [m["id"] for m in result] == [1]
 
-    def fake_discover(params):
-        calls.append(params)
-        return {"results": [movie(1)]}
 
-    monkeypatch.setattr(tmdb, "discover_movies", fake_discover)
-    streaming_picks.get_streaming_picks([8], [], set())
-    first_call_count = len(calls)
-    streaming_picks.get_streaming_picks([8], [], set())
-    # Same provider set, same pools -> second call should hit cache for at
-    # least the top_rated pool (no randomness there), not re-fetch everything.
-    assert len(calls) < first_call_count * 2
+def test_a_movie_on_any_selected_provider_is_kept(monkeypatch, app_ctx):
+    monkeypatch.setattr(movie_cache, "get_movie", lambda movie_id, segments=(): providers_payload({337: None}))
+    result = streaming_picks.filter_by_availability([movie(1)], [8, 337])
+    assert [m["id"] for m in result] == [1]
+
+
+def test_preserves_input_order(monkeypatch, app_ctx):
+    monkeypatch.setattr(movie_cache, "get_movie", lambda movie_id, segments=(): providers_payload({8: None}))
+    result = streaming_picks.filter_by_availability([movie(3), movie(1), movie(2)], [8])
+    assert [m["id"] for m in result] == [3, 1, 2]
+
+
+def test_a_provider_lookup_failure_fails_open_and_keeps_the_movie(monkeypatch, app_ctx):
+    def boom(movie_id, segments=()):
+        raise RuntimeError("TMDB unreachable")
+
+    monkeypatch.setattr(movie_cache, "get_movie", boom)
+    result = streaming_picks.filter_by_availability([movie(1)], [8])
+    assert [m["id"] for m in result] == [1]
+
+
+def test_no_flatrate_entry_for_the_region_excludes_the_movie(monkeypatch, app_ctx):
+    monkeypatch.setattr(movie_cache, "get_movie", lambda movie_id, segments=(): {"watch/providers": {"results": {}}})
+    result = streaming_picks.filter_by_availability([movie(1)], [8])
+    assert result == []

@@ -14,7 +14,7 @@ from app.controllers import movies as movies_controller
 from app.services import daily_picks
 from app.services.recommendations import UserSignals
 from app.utils import auth as auth_utils
-from tests.fakes import FakeSupabase
+from tests.fakes import FakeProfileTable, FakeSupabase
 
 USER = "user-1"
 UTC = ZoneInfo("UTC")
@@ -434,6 +434,12 @@ def client(monkeypatch):
     app = create_app()
     app.config.update(TESTING=True, RATELIMIT_ENABLED=False)
     monkeypatch.setattr(auth_utils, "_validate_token", lambda token: SimpleNamespace(id=USER, factors=[]) if token == "good" else None)
+    # The movies-of-the-day/picks-of-the-week routes also read the caller's
+    # streaming-filter prefs now — off by default here, since that's not
+    # what these tests are about. Tests that need get_supabase for
+    # something else (the not-interested route) monkeypatch over this.
+    profile_table = FakeProfileTable({"id": USER, "streaming_filter_enabled": False, "streaming_provider_ids": []})
+    monkeypatch.setattr(movies_controller, "get_supabase", lambda: SimpleNamespace(table=lambda _name: profile_table))
     with app.test_client() as c:
         yield c
 

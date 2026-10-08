@@ -65,16 +65,44 @@ def top_rated():
         return server_error("Failed to fetch top rated movies", exc, 502)
 
 
+def _streaming_filter_prefs(supabase, user_id: str) -> list[int]:
+    """The provider ids to filter by, or [] if the filter is off (or not yet
+    migrated) — [] is what streaming_picks.filter_by_availability treats as
+    a no-op, so callers can apply it unconditionally."""
+    try:
+        row = (
+            supabase.table("profiles")
+            .select("streaming_filter_enabled, streaming_provider_ids")
+            .eq("id", user_id)
+            .single()
+            .execute()
+        ).data or {}
+    except Exception as exc:
+        # sql/012 or sql/013 not applied yet — same as the filter being off.
+        if "streaming_filter_enabled" not in str(exc) and "streaming_provider_ids" not in str(exc):
+            logger.exception("Failed to read streaming-filter prefs for %s", user_id)
+        return []
+    if not row.get("streaming_filter_enabled"):
+        return []
+    return row.get("streaming_provider_ids") or []
+
+
 @movies_bp.get("/for-you")
 @require_auth
 @limiter.limit("10 per minute")
 def for_you():
     """Personalized recommendation feed — see app.services.recommendations.
-    ?force=true bypasses the 24h cache and recomputes immediately."""
+    ?force=true bypasses the 24h cache and recomputes immediately. Filtered
+    to the user's streaming services if they've turned that on in Settings
+    (never filtered: Most Popular This Week — see streaming_picks.py)."""
     user = request.current_user
+    supabase = get_supabase()
     force = request.args.get("force", "").lower() in ("true", "1")
     try:
         data = recommendations.get_recommendations_for_user(str(user.id), force=force)
+        provider_ids = _streaming_filter_prefs(supabase, str(user.id))
+        data["results"] = streaming_picks.filter_by_availability(data["results"], provider_ids)
+        data["total_results"] = len(data["results"])
         return jsonify(data)
     except Exception as exc:
         return server_error("Failed to fetch recommendations", exc, 500)
@@ -85,14 +113,20 @@ def for_you():
 @limiter.limit("20 per minute")
 def movies_of_the_day():
     """Three picks, new every day in the caller's timezone (?tz=, IANA) —
-    see app.services.daily_picks. ?force=true recomputes today's."""
+    see app.services.daily_picks. ?force=true recomputes today's. Filtered
+    to the user's streaming services if that's turned on (see for_you)."""
     user = request.current_user
+    supabase = get_supabase()
     tz = parse_tz(request.args.get("tz"))
     if tz is None:
         return jsonify({"error": "Invalid tz"}), 400
     force = request.args.get("force", "").lower() in ("true", "1")
     try:
-        return jsonify(daily_picks.get_daily_picks(str(user.id), tz, force=force))
+        data = daily_picks.get_daily_picks(str(user.id), tz, force=force)
+        provider_ids = _streaming_filter_prefs(supabase, str(user.id))
+        data["results"] = streaming_picks.filter_by_availability(data["results"], provider_ids)
+        data["total_results"] = len(data["results"])
+        return jsonify(data)
     except Exception as exc:
         return server_error("Failed to fetch movies of the day", exc, 500)
 
@@ -104,8 +138,13 @@ def picks_of_the_week():
     """The old name, kept so a browser still running the pre-rename client
     keeps working through a deploy. Serves the same daily picks, on UTC days."""
     user = request.current_user
+    supabase = get_supabase()
     try:
-        return jsonify(daily_picks.get_daily_picks(str(user.id), parse_tz("UTC")))
+        data = daily_picks.get_daily_picks(str(user.id), parse_tz("UTC"))
+        provider_ids = _streaming_filter_prefs(supabase, str(user.id))
+        data["results"] = streaming_picks.filter_by_availability(data["results"], provider_ids)
+        data["total_results"] = len(data["results"])
+        return jsonify(data)
     except Exception as exc:
         return server_error("Failed to fetch movies of the day", exc, 500)
 
@@ -119,52 +158,6 @@ def streaming_providers():
         return jsonify(streaming_picks.list_streaming_providers())
     except Exception as exc:
         return server_error("Failed to fetch streaming providers", exc, 502)
-
-
-@movies_bp.get("/streaming-picks")
-@require_auth
-@limiter.limit("20 per minute")
-def streaming_picks_route():
-    """"Your Streaming Services": popular/well-rated/genre-affinity films
-    available on the providers this user selected in Settings.
-    ?exclude_seen=true drops anything they've already reviewed."""
-    user = request.current_user
-    supabase = get_supabase()
-    exclude_seen = request.args.get("exclude_seen", "").lower() in ("true", "1")
-
-    try:
-        profile_result = (
-            supabase.table("profiles")
-            .select("streaming_provider_ids, onboarding_genre_ids")
-            .eq("id", str(user.id))
-            .single()
-            .execute()
-        )
-        row = profile_result.data or {}
-    except Exception as exc:
-        # sql/012 not applied yet — no provider ids to read, so there's
-        # nothing to show rather than a hard failure.
-        if "streaming_provider_ids" not in str(exc):
-            return server_error("Failed to fetch streaming picks", exc, 500)
-        row = {}
-
-    provider_ids = row.get("streaming_provider_ids") or []
-    genre_ids = row.get("onboarding_genre_ids") or []
-
-    try:
-        exclude_ids: set[int] = set()
-        if exclude_seen and provider_ids:
-            reviewed = (
-                supabase.table("reviews")
-                .select("movie_id")
-                .eq("user_id", str(user.id))
-                .execute()
-            )
-            exclude_ids = {r["movie_id"] for r in reviewed.data}
-        results = streaming_picks.get_streaming_picks(provider_ids, genre_ids, exclude_ids)
-        return jsonify({"results": results})
-    except Exception as exc:
-        return server_error("Failed to fetch streaming picks", exc, 500)
 
 
 @movies_bp.post("/not-interested")

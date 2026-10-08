@@ -25,7 +25,7 @@ BASE_SELF_PROFILE_COLUMNS = (
     "id, username, bio, profile_visibility, avatar_color, avatar_url, avatar_focal_y, avatar_zoom, "
     "hide_recent_movies, mute_recommendations, mute_friend_requests, has_onboarded, onboarding_genre_ids"
 )
-OPTIONAL_SELF_PROFILE_COLUMNS = ("hide_friends_list", "seen_tutorials", "streaming_provider_ids")
+OPTIONAL_SELF_PROFILE_COLUMNS = ("hide_friends_list", "seen_tutorials", "streaming_provider_ids", "streaming_filter_enabled")
 
 
 def _self_profile_columns(missing: set[str] = frozenset()) -> str:
@@ -251,6 +251,9 @@ def update_profile():
         if any(not (0 < p < 100_000) for p in provider_ids):
             return jsonify({"error": "Invalid provider id in streaming_provider_ids"}), 400
         updates["streaming_provider_ids"] = provider_ids
+
+    if "streaming_filter_enabled" in body:
+        updates["streaming_filter_enabled"] = bool(body["streaming_filter_enabled"])
 
     if not updates:
         return jsonify({"error": "No valid fields provided"}), 400

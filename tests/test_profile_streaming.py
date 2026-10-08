@@ -1,8 +1,8 @@
-"""The self-profile support for streaming-service selection:
-GET /api/profile/ returning streaming_provider_ids, and PUT /api/profile/
-validating and saving a new list — including falling back gracefully (and
-dropping seen_tutorials too, since a very stale deploy could be missing
-both) before sql/012_streaming_services.sql has been applied.
+"""The self-profile support for streaming-service selection: GET /api/profile/
+returning streaming_provider_ids + streaming_filter_enabled, and PUT
+/api/profile/ validating and saving them — including falling back gracefully
+before sql/012_streaming_services.sql / sql/013_streaming_filter_toggle.sql
+have been applied.
 """
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -34,6 +34,7 @@ BASE_ROW = {
     "onboarding_genre_ids": [],
     "seen_tutorials": [],
     "streaming_provider_ids": [],
+    "streaming_filter_enabled": False,
 }
 
 AUTH = {"Authorization": "Bearer good"}
@@ -112,3 +113,37 @@ def test_rejects_a_non_list_value(make_client):
     client, _ = make_client(BASE_ROW)
     res = client.put("/api/profile/", headers=AUTH, json={"streaming_provider_ids": "netflix"})
     assert res.status_code == 400
+
+
+# ─── streaming_filter_enabled ─────────────────────────────────────────────────
+
+def test_self_profile_includes_streaming_filter_enabled(make_client):
+    row = dict(BASE_ROW, streaming_filter_enabled=True)
+    client, _ = make_client(row)
+    body = client.get("/api/profile/", headers=AUTH).get_json()
+    assert body["streaming_filter_enabled"] is True
+
+
+def test_self_profile_falls_back_when_only_the_toggle_column_is_missing(make_client):
+    """Keeping provider ids selectable even if sql/013 hasn't landed yet —
+    only the toggle itself is missing, not the whole streaming feature."""
+    client, _ = make_client(dict(BASE_ROW, streaming_provider_ids=[8]), missing={"streaming_filter_enabled"})
+    res = client.get("/api/profile/", headers=AUTH)
+    assert res.status_code == 200
+    body = res.get_json()
+    assert "streaming_filter_enabled" not in body
+    assert body["streaming_provider_ids"] == [8]
+
+
+def test_saving_streaming_filter_enabled(make_client):
+    client, table = make_client(BASE_ROW)
+    res = client.put("/api/profile/", headers=AUTH, json={"streaming_filter_enabled": True})
+    assert res.status_code == 200
+    assert res.get_json()["streaming_filter_enabled"] is True
+    assert table.row["streaming_filter_enabled"] is True
+
+
+def test_saving_streaming_filter_enabled_coerces_truthy_values(make_client):
+    client, table = make_client(BASE_ROW)
+    client.put("/api/profile/", headers=AUTH, json={"streaming_filter_enabled": 1})
+    assert table.row["streaming_filter_enabled"] is True
