@@ -8,7 +8,7 @@ from app.utils.sanitize import sanitize_text
 from app.utils.social import filter_friend_ids, filter_owned_group_ids
 from app.services import tmdb
 from app.services import movie_cache
-from app.services import daily_picks, recommendations, streaming_picks
+from app.services import daily_picks, recommendations, streaming_picks, streaming_worlds
 from app.services.supabase_client import get_supabase
 from app.utils.errors import server_error
 from app.utils.tz import parse_tz
@@ -153,6 +153,23 @@ def streaming_providers():
         return jsonify(streaming_picks.list_streaming_providers())
     except Exception as exc:
         return server_error("Failed to fetch streaming providers", exc, 502)
+
+
+@movies_bp.get("/streaming-worlds/<int:provider_id>")
+@require_auth
+@limiter.limit("30 per minute")
+def streaming_world(provider_id: int):
+    """One streaming service's own Discover sub-page — Popular/For You/
+    Different, all scoped to just that service. See
+    app.services.streaming_worlds."""
+    if not (0 < provider_id < 100000):
+        return jsonify({"error": "Invalid provider_id"}), 400
+    user = request.current_user
+    try:
+        data = streaming_worlds.get_streaming_world(str(user.id), provider_id)
+        return jsonify(data)
+    except Exception as exc:
+        return server_error("Failed to fetch streaming world", exc, 500)
 
 
 @movies_bp.post("/not-interested")
