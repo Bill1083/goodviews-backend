@@ -12,6 +12,7 @@ streaming_picks.py's docstring and recommendations._backfill_items' deadline
 param) — there's no N+1 here to bound in the first place.
 """
 import logging
+import time
 from concurrent.futures import ThreadPoolExecutor, wait
 
 from flask import current_app
@@ -23,12 +24,25 @@ from app.services.supabase_client import get_supabase
 logger = logging.getLogger(__name__)
 
 REGION = streaming_picks.REGION
-POOL_SIZE = 18
+
+# Every section is topped up to the same length regardless of how deep its
+# own genre-scoped catalog goes — two pages of 10 on the client (see
+# StreamingWorldPage's pagination), never a visibly shorter "Different" row.
+TARGET_POOL_SIZE = 20
+PAGE_SIZE = 10
 
 # Three discover calls run in parallel, each already bounded by tmdb's own
 # per-call retry deadline (~10s) — this is the outer belt-and-braces bound on
 # the whole batch, same philosophy as streaming_picks._AVAILABILITY_BUDGET_SECONDS.
 _BUDGET_SECONDS = 8.0
+
+# Padding a short pool (most often "Different", whose genre scoping can
+# easily come up thin for a smaller catalog) is a handful of *sequential*
+# extra discover calls, done after the parallel phase above — bounded the
+# same way recommendations._backfill_items bounds its own catch-up loop:
+# checked between pages, not able to abort one already in flight.
+_PAD_DEADLINE_SECONDS = 3.0
+_PAD_MAX_PAGE = 4
 
 _DISCOVER_BASE = {
     "include_adult": "false",
@@ -54,12 +68,15 @@ def _discover(provider_id: int, params: dict) -> list[dict]:
 def _affinity_genres(signals) -> tuple[list[int], list[int]]:
     """(for_you genres, different genres) — top-ranked liked genres for the
     first, the next tier down (still liked, just not the user's favourites)
-    for the second. Falls back to onboarding genres alone when there's no
-    review history yet, so a brand-new account still gets *some* split
-    between the two instead of two identical popularity lists."""
+    for the second. different_genres is deliberately [] rather than falling
+    back to for_you_genres when there's no distinct next tier: get_streaming_world's
+    own dedup already strips anything "different" shares with "popular"/
+    "for_you", so reusing the same genres here would just hand it a pool
+    that's entirely deduped away — [] correctly routes it to that function's
+    general popularity fallback instead, a real (if less personalized) list."""
     ranked = sorted((g for g, w in signals.genre_affinity.items() if w > 0), key=lambda g: -signals.genre_affinity[g])
     if ranked:
-        return ranked[:3], (ranked[3:6] or ranked[:3])
+        return ranked[:3], ranked[3:6]
     onboarding = list(signals.onboarding_genre_ids)
     return onboarding[:3], onboarding[3:6]
 
@@ -121,9 +138,35 @@ def get_streaming_world(user_id: str, provider_id: int) -> dict:
                 continue
             seen.add(m["id"])
             unique.append(m)
-            if len(unique) >= POOL_SIZE:
+            if len(unique) >= TARGET_POOL_SIZE:
                 break
         out[kind] = unique
+
+    # Every section ends up the same length, even one TMDB genuinely has few
+    # matches for — padded with further popularity-sorted results the other
+    # sections didn't already claim ("some randoms that don't fit any genres"
+    # is an acceptable tail for Different specifically, and this applies the
+    # same top-up to any section, since a niche service can leave Popular or
+    # For You thin too). One shared filler cursor, so a page already fetched
+    # to pad one section is never re-fetched to pad the next.
+    filler: list[dict] = []
+    filler_page = 2
+    deadline = time.monotonic() + _PAD_DEADLINE_SECONDS
+
+    def _next_filler() -> dict | None:
+        nonlocal filler_page
+        while not filler and filler_page <= _PAD_MAX_PAGE and time.monotonic() < deadline:
+            filler.extend(m for m in _discover(provider_id, {"sort_by": "popularity.desc", "page": filler_page}) if m["id"] not in seen)
+            filler_page += 1
+        return filler.pop(0) if filler else None
+
+    for kind in ("popular", "for_you", "different"):
+        while len(out[kind]) < TARGET_POOL_SIZE:
+            m = _next_filler()
+            if m is None:
+                break
+            seen.add(m["id"])
+            out[kind].append(m)
 
     stubs = [_upsert_movie_stub(m) for films in out.values() for m in films]
     if stubs:

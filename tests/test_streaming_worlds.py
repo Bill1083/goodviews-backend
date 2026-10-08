@@ -89,7 +89,7 @@ def test_affinity_genres_ranks_by_weight_and_falls_back_to_onboarding(app_ctx):
     ranked = SimpleNamespace(genre_affinity={28: 1.0, 12: 5.0, 16: 3.0}, onboarding_genre_ids=[])
     for_you, different = streaming_worlds._affinity_genres(ranked)
     assert for_you == [12, 16, 28]  # highest-weighted first
-    assert different == [12, 16, 28]  # fewer than 4 genres total -> same tier reused
+    assert different == []  # fewer than 4 genres total -> no distinct second tier, not a reused one
 
     cold = SimpleNamespace(genre_affinity={}, onboarding_genre_ids=[28, 12, 16, 35])
     for_you, different = streaming_worlds._affinity_genres(cold)
@@ -129,6 +129,62 @@ def test_movie_stubs_are_upserted_for_every_pool(app_ctx, monkeypatch):
 
     stored_ids = {m["id"] for m in db.tables.get("movies", [])}
     assert {1, 2} <= stored_ids
+
+
+def test_short_pools_are_padded_to_the_target_size_from_a_shared_filler(app_ctx, monkeypatch):
+    """Popular already has a full page; For You and Different are each 5
+    short. Padding tops both up from the same filler page rather than
+    fetching it twice."""
+    monkeypatch.setattr(streaming_worlds, "_affinity_genres", lambda signals: ([28], [12]))
+    fetch_log = []
+
+    def by_params(params):
+        fetch_log.append(dict(params))
+        if params.get("with_genres") == "28":
+            return [movie(mid) for mid in range(100, 115)]  # 15 — needs 5 more
+        if params.get("with_genres") == "12":
+            return [movie(mid) for mid in range(200, 215)]  # 15 — needs 5 more
+        if params.get("sort_by") == "popularity.desc" and params.get("page", 1) == 1:
+            return [movie(mid) for mid in range(1, 21)]  # already 20 — no padding needed
+        if params.get("page") == 2:
+            return [movie(mid) for mid in range(1000, 1010)]  # exactly enough for both shortfalls combined
+        return []
+
+    install(monkeypatch, by_params=by_params)
+    out = streaming_worlds.get_streaming_world("u1", 8)
+
+    assert len(out["popular"]) == streaming_worlds.TARGET_POOL_SIZE
+    assert len(out["for_you"]) == streaming_worlds.TARGET_POOL_SIZE
+    assert len(out["different"]) == streaming_worlds.TARGET_POOL_SIZE
+    all_ids = [m["id"] for films in out.values() for m in films]
+    assert len(all_ids) == len(set(all_ids))  # no filler movie used to pad more than one section
+
+    filler_fetches = [p for p in fetch_log if p.get("page") == 2 and "with_genres" not in p]
+    assert len(filler_fetches) == 1
+
+
+def test_padding_gives_up_at_its_deadline_rather_than_hang(app_ctx, monkeypatch):
+    import time as time_mod
+
+    monkeypatch.setattr(streaming_worlds, "_affinity_genres", lambda signals: ([], []))
+    monkeypatch.setattr(streaming_worlds, "_PAD_DEADLINE_SECONDS", 0.2)
+
+    def by_params(params):
+        if params.get("sort_by") == "popularity.desc" and params.get("page", 1) == 1:
+            return [movie(1)]
+        if params.get("page", 0) >= 2:
+            time_mod.sleep(0.3)
+            return [movie(2)]
+        return []
+
+    install(monkeypatch, by_params=by_params)
+
+    started = time_mod.monotonic()
+    out = streaming_worlds.get_streaming_world("u1", 8)
+    elapsed = time_mod.monotonic() - started
+
+    assert elapsed < 2  # one slow filler fetch, not several — the deadline stopped it from trying more
+    assert len(out["popular"]) < streaming_worlds.TARGET_POOL_SIZE  # gave up short rather than hang for it
 
 
 def test_route_rejects_an_out_of_range_provider_id(monkeypatch):
