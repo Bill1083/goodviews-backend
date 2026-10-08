@@ -52,6 +52,7 @@ CURATED_PROVIDER_NAMES = [
     "stan",
     "binge",
     "paramount plus",
+    "hbo max",
     "apple tv",
     "foxtel now",
     "britbox",
