@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 
 from flask import current_app
 
-from app.services import movie_cache, tmdb
+from app.services import movie_cache, streaming_picks, tmdb
 from app.services.supabase_client import get_supabase
 
 logger = logging.getLogger(__name__)
@@ -81,6 +81,72 @@ def get_recommendations_for_user(user_id: str, force: bool = False) -> dict:
         on_conflict="user_id",
     ).execute()
     return _hydrate(items, supabase)
+
+
+# How many extra candidates to pull per backfill round below, and how many
+# rounds to try before settling for however many ended up fitting — bounds
+# the worst case (a very narrow provider selection) to a handful of extra
+# overflow-pop / provider-lookup rounds rather than looping indefinitely.
+_STREAMING_BACKFILL_BATCH = 6
+_STREAMING_BACKFILL_MAX_ROUNDS = 6
+
+
+def get_recommendations_for_user_streaming(user_id: str, provider_ids: list[int], force: bool = False) -> dict:
+    """The same feed as get_recommendations_for_user, but with the streaming
+    filter applied *without shrinking the page* — turning the filter on
+    changes which films show, not how many. Tops back up to the original
+    count by draining the same scored overflow pool mark_not_interested
+    already uses (then generic top-rated backfill once that's exhausted),
+    filtering each new batch the same way, until the count is restored or
+    there's nothing left worth trying."""
+    base = get_recommendations_for_user(user_id, force=force)
+    if not provider_ids:
+        return base
+
+    target = len(base["results"])
+    kept = streaming_picks.filter_by_availability(base["results"], provider_ids)
+    if len(kept) >= target:
+        return {**base, "results": kept, "total_results": len(kept)}
+
+    supabase = get_supabase()
+    cached = (
+        supabase.table("user_recommendations").select("overflow").eq("user_id", user_id).limit(1).execute()
+    )
+    overflow = (cached.data[0].get("overflow") if cached.data else None) or []
+
+    kept_ids = {m["id"] for m in kept}
+    excluded_ids = {m["id"] for m in base["results"]}  # don't re-offer something this round already rejected
+
+    for _ in range(_STREAMING_BACKFILL_MAX_ROUNDS):
+        if len(kept) >= target:
+            break
+        batch: list[dict] = []
+        while overflow and len(batch) < _STREAMING_BACKFILL_BATCH:
+            candidate = overflow.pop(0)
+            if candidate["movie_id"] not in excluded_ids:
+                batch.append(candidate)
+                excluded_ids.add(candidate["movie_id"])
+        if not batch:
+            batch = _backfill_items(excluded_ids, _STREAMING_BACKFILL_BATCH, supabase)
+            if not batch:
+                break
+            excluded_ids |= {b["movie_id"] for b in batch}
+
+        hydrated = _hydrate(batch, supabase)["results"]
+        for m in streaming_picks.filter_by_availability(hydrated, provider_ids):
+            if m["id"] not in kept_ids:
+                kept.append(m)
+                kept_ids.add(m["id"])
+
+    if cached.data:
+        # Only the drained overflow is persisted — same "consumed once" rule
+        # mark_not_interested's replacements already follow. The extra items
+        # found here aren't written into the cached `items` list itself, so
+        # an unfiltered view later isn't shaped by what a filtered one needed.
+        supabase.table("user_recommendations").update({"overflow": overflow}).eq("user_id", user_id).execute()
+
+    kept = kept[:target]
+    return {"page": 1, "results": kept, "total_pages": 1, "total_results": len(kept)}
 
 
 def mark_not_interested(user_id: str, movie_id: int, scope: str = "movie") -> dict | None:

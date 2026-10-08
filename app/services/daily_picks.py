@@ -33,7 +33,7 @@ import logging
 import random
 from datetime import date, datetime, timedelta, timezone, tzinfo
 
-from app.services import tmdb
+from app.services import streaming_picks, tmdb
 from app.services.movie_cache import GENRE_MAP
 from app.services.pg import paginate
 from app.services.recommendations import (
@@ -336,6 +336,41 @@ def get_daily_picks(user_id: str, tz: tzinfo, force: bool = False, now: datetime
         recent = past + [{"movie_id": it["movie_id"], "day": today.isoformat()} for it in new]
         _save_row(supabase, user_id, todays, recent, now)
     return _hydrate(todays, supabase)
+
+
+# How many drop-and-refill rounds to try before settling for however many
+# picks ended up available — each round can replace several slots in one
+# get_daily_picks() call, so this bounds worst case to a handful of rounds
+# even with a very narrow provider selection, not an unbounded loop.
+_STREAMING_BACKFILL_MAX_ROUNDS = 4
+
+
+def get_daily_picks_streaming(user_id: str, tz: tzinfo, provider_ids: list[int], force: bool = False) -> dict:
+    """Today's picks, filtered to the user's streaming services *without
+    shrinking the count* — a pick that doesn't pass the filter is dropped
+    the same way "not interested" drops one (daily_picks.drop_from_daily_picks),
+    which is already designed to have the next fetch refill just that slot;
+    this just repeats that drop-and-refetch a few times, filtering again
+    each round, until every slot passes or there's nothing better to offer."""
+    data = get_daily_picks(user_id, tz, force=force)
+    if not provider_ids:
+        return data
+
+    supabase = get_supabase()
+    for _ in range(_STREAMING_BACKFILL_MAX_ROUNDS):
+        kept = streaming_picks.filter_by_availability(data["results"], provider_ids)
+        if len(kept) >= len(data["results"]):
+            data["results"] = kept
+            data["total_results"] = len(kept)
+            return data
+        unavailable_ids = {m["id"] for m in data["results"]} - {m["id"] for m in kept}
+        for movie_id in unavailable_ids:
+            drop_from_daily_picks(supabase, user_id, movie_id)
+        data = get_daily_picks(user_id, tz)
+
+    data["results"] = streaming_picks.filter_by_availability(data["results"], provider_ids)
+    data["total_results"] = len(data["results"])
+    return data
 
 
 def drop_from_daily_picks(supabase, user_id: str, movie_id: int) -> bool:

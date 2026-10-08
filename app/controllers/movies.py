@@ -93,16 +93,15 @@ def _streaming_filter_prefs(supabase, user_id: str) -> list[int]:
 def for_you():
     """Personalized recommendation feed — see app.services.recommendations.
     ?force=true bypasses the 24h cache and recomputes immediately. Filtered
-    to the user's streaming services if they've turned that on in Settings
+    to the user's streaming services if they've turned that on in Settings,
+    backfilled so the filter changes *which* films show, not how many
     (never filtered: Most Popular This Week — see streaming_picks.py)."""
     user = request.current_user
     supabase = get_supabase()
     force = request.args.get("force", "").lower() in ("true", "1")
     try:
-        data = recommendations.get_recommendations_for_user(str(user.id), force=force)
         provider_ids = _streaming_filter_prefs(supabase, str(user.id))
-        data["results"] = streaming_picks.filter_by_availability(data["results"], provider_ids)
-        data["total_results"] = len(data["results"])
+        data = recommendations.get_recommendations_for_user_streaming(str(user.id), provider_ids, force=force)
         return jsonify(data)
     except Exception as exc:
         return server_error("Failed to fetch recommendations", exc, 500)
@@ -114,7 +113,7 @@ def for_you():
 def movies_of_the_day():
     """Three picks, new every day in the caller's timezone (?tz=, IANA) —
     see app.services.daily_picks. ?force=true recomputes today's. Filtered
-    to the user's streaming services if that's turned on (see for_you)."""
+    (and backfilled back up to three) the same way as for_you."""
     user = request.current_user
     supabase = get_supabase()
     tz = parse_tz(request.args.get("tz"))
@@ -122,10 +121,8 @@ def movies_of_the_day():
         return jsonify({"error": "Invalid tz"}), 400
     force = request.args.get("force", "").lower() in ("true", "1")
     try:
-        data = daily_picks.get_daily_picks(str(user.id), tz, force=force)
         provider_ids = _streaming_filter_prefs(supabase, str(user.id))
-        data["results"] = streaming_picks.filter_by_availability(data["results"], provider_ids)
-        data["total_results"] = len(data["results"])
+        data = daily_picks.get_daily_picks_streaming(str(user.id), tz, provider_ids, force=force)
         return jsonify(data)
     except Exception as exc:
         return server_error("Failed to fetch movies of the day", exc, 500)
@@ -140,10 +137,8 @@ def picks_of_the_week():
     user = request.current_user
     supabase = get_supabase()
     try:
-        data = daily_picks.get_daily_picks(str(user.id), parse_tz("UTC"))
         provider_ids = _streaming_filter_prefs(supabase, str(user.id))
-        data["results"] = streaming_picks.filter_by_availability(data["results"], provider_ids)
-        data["total_results"] = len(data["results"])
+        data = daily_picks.get_daily_picks_streaming(str(user.id), parse_tz("UTC"), provider_ids)
         return jsonify(data)
     except Exception as exc:
         return server_error("Failed to fetch movies of the day", exc, 500)
