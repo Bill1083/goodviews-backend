@@ -119,7 +119,15 @@ def get_public_profile(user_id: str):
 
 @profile_bp.put("/")
 @require_auth
-@limiter.limit("20 per minute")
+# Was 20/minute, which was fine when this endpoint only ever saw a handful
+# of deliberate writes per session (email, bio, a toggle here and there).
+# The streaming-provider picker changed that: each logo tap is its own PUT,
+# so a user toggling a few services (or just stress-testing it) can easily
+# fire more than 20 in well under a minute. Once a request gets 429'd here,
+# the client's optimistic UI has nothing to resync against until the next
+# successful write, which looked exactly like "it stopped working, even
+# going slowly" — the window just hadn't reset yet.
+@limiter.limit("120 per minute")
 def update_profile():
     user = request.current_user
     body = request.get_json(silent=True) or {}

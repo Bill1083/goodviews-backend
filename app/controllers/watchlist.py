@@ -72,7 +72,7 @@ def get_watchlist():
 
 @watchlist_bp.post("/")
 @require_auth
-@limiter.limit("30 per minute")
+@limiter.limit("60 per minute")  # matches GET's own limit — see update_profile for why this needed raising
 def add_to_watchlist():
     user = request.current_user
     body = request.get_json(silent=True) or {}
@@ -156,7 +156,7 @@ def add_to_watchlist():
 
 @watchlist_bp.delete("/<int:movie_id>")
 @require_auth
-@limiter.limit("30 per minute")
+@limiter.limit("60 per minute")  # matches GET's own limit — see update_profile for why this needed raising
 def remove_from_watchlist(movie_id: int):
     user = request.current_user
     supabase = get_supabase()

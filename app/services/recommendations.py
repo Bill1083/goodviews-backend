@@ -1,4 +1,5 @@
 import logging
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -83,12 +84,16 @@ def get_recommendations_for_user(user_id: str, force: bool = False) -> dict:
     return _hydrate(items, supabase)
 
 
-# How many extra candidates to pull per backfill round below, and how many
-# rounds to try before settling for however many ended up fitting — bounds
-# the worst case (a very narrow provider selection) to a handful of extra
-# overflow-pop / provider-lookup rounds rather than looping indefinitely.
+# How many extra candidates to pull per backfill round, how many rounds to
+# try, and a hard wall-clock budget for the whole backfill loop — each
+# round's own filter_by_availability call is already bounded (see
+# streaming_picks._AVAILABILITY_BUDGET_SECONDS), but several rounds of that
+# can still add up past the client's own request timeout on a bad run, so
+# this is the belt to that braces: stop starting new rounds once the budget
+# is spent and return whatever fits by then, rather than let it compound.
 _STREAMING_BACKFILL_BATCH = 6
 _STREAMING_BACKFILL_MAX_ROUNDS = 6
+_STREAMING_BACKFILL_DEADLINE_SECONDS = 6.0
 
 
 def get_recommendations_for_user_streaming(user_id: str, provider_ids: list[int], force: bool = False) -> dict:
@@ -116,9 +121,10 @@ def get_recommendations_for_user_streaming(user_id: str, provider_ids: list[int]
 
     kept_ids = {m["id"] for m in kept}
     excluded_ids = {m["id"] for m in base["results"]}  # don't re-offer something this round already rejected
+    deadline = time.monotonic() + _STREAMING_BACKFILL_DEADLINE_SECONDS
 
     for _ in range(_STREAMING_BACKFILL_MAX_ROUNDS):
-        if len(kept) >= target:
+        if len(kept) >= target or time.monotonic() >= deadline:
             break
         batch: list[dict] = []
         while overflow and len(batch) < _STREAMING_BACKFILL_BATCH:

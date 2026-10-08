@@ -6,13 +6,27 @@ the Day — NOT to Most Popular This Week, which stays unfiltered on purpose
 the personalized/evergreen feeds).
 """
 import logging
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, wait
 
 from flask import current_app
 
 from app.services import movie_cache, tmdb
 
 logger = logging.getLogger(__name__)
+
+# How long filter_by_availability is willing to wait for ALL of a batch's
+# per-movie provider lookups combined, regardless of how many movies or how
+# slow/flaky TMDB is being — past this, anything still unresolved is
+# treated as available (same fail-open philosophy as a single lookup's own
+# exception handling, just for "too slow" instead of "errored"). Without an
+# outer bound here, a batch of movies whose "providers" segment has never
+# been fetched before (true for most of a recommendation feed — that
+# segment is normally only warmed by someone actually opening a movie's
+# detail page) hitting TMDB's own documented connection-reset flakiness
+# (up to 6 retries, 10s deadline *per movie* — see tmdb._DEADLINE_SECONDS)
+# could collectively take far longer than the client's own request
+# timeout, which is exactly what "nothing ever loaded" was.
+_AVAILABILITY_BUDGET_SECONDS = 3.0
 
 # Matches the region MovieDetailModal's own WatchProvidersModal already uses
 # (see client/src/components/MovieDetailModal.tsx) — one region for now,
@@ -101,13 +115,33 @@ def filter_by_availability(movies: list[dict], provider_ids: list[int]) -> list[
     _enrich_movies: movie_cache.get_movie needs current_app, which a
     ThreadPoolExecutor worker doesn't inherit on its own) — a feed is at
     most ~20 films, and almost every lookup is a cached Postgres read, but a
-    fully cold cache doing them one at a time would otherwise add up."""
+    fully cold cache doing them one at a time would otherwise add up.
+    Bounded to _AVAILABILITY_BUDGET_SECONDS total — see that constant."""
     if not provider_ids or not movies:
         return movies
 
     ids = set(provider_ids)
     app = current_app._get_current_object()
-    with ThreadPoolExecutor(max_workers=min(len(movies), 10)) as executor:
+    executor = ThreadPoolExecutor(max_workers=min(len(movies), 10))
+    try:
         futures = {executor.submit(_available_on, m["id"], ids, app): m["id"] for m in movies}
-        keep_ids = {futures[f] for f in as_completed(futures) if f.result()}
+        done, not_done = wait(futures, timeout=_AVAILABILITY_BUDGET_SECONDS)
+
+        keep_ids: set[int] = set()
+        for f in done:
+            try:
+                if f.result():
+                    keep_ids.add(futures[f])
+            except Exception:
+                keep_ids.add(futures[f])  # fail open — see _available_on
+        if not_done:
+            logger.warning("Streaming-filter availability check timed out for %d/%d movies", len(not_done), len(movies))
+            keep_ids |= {futures[f] for f in not_done}
+    finally:
+        # Don't block returning on stragglers past the budget above — let
+        # them finish warming the cache in the background unsupervised,
+        # harmless since they're just reads. (shutdown(wait=True), the
+        # default via `with`, would defeat the timeout entirely by blocking
+        # here until every thread finishes regardless.)
+        executor.shutdown(wait=False)
     return [m for m in movies if m["id"] in keep_ids]

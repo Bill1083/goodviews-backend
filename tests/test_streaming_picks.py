@@ -1,5 +1,7 @@
 """Curating TMDB's AU provider catalog down to recognizable names, and
 filtering a feed to only films available (flatrate) on a given provider set."""
+import time
+
 import pytest
 
 from app import create_app
@@ -116,3 +118,32 @@ def test_no_flatrate_entry_for_the_region_excludes_the_movie(monkeypatch, app_ct
     monkeypatch.setattr(movie_cache, "get_movie", lambda movie_id, segments=(): {"watch/providers": {"results": {}}})
     result = streaming_picks.filter_by_availability([movie(1)], [8])
     assert result == []
+
+
+def test_a_hung_lookup_times_out_and_fails_open_instead_of_blocking(monkeypatch, app_ctx):
+    """The actual production incident this guards against: TMDB's own
+    documented connection-reset flakiness (tmdb._DEADLINE_SECONDS=10,
+    up to 6 retries) meant a batch of movies whose "providers" segment had
+    never been cached before could collectively take far longer than the
+    client's own request timeout — "nothing ever loaded". A lookup that
+    doesn't finish within the budget must fail open (keep the movie) and
+    the call must still return promptly, not wait for it."""
+    monkeypatch.setattr(streaming_picks, "_AVAILABILITY_BUDGET_SECONDS", 0.3)
+
+    def slow_lookup(movie_id, segments=()):
+        if movie_id == 2:
+            time.sleep(2)  # far longer than the 0.3s budget above
+            return providers_payload({8: None})
+        return providers_payload({8: None} if movie_id == 1 else {})
+
+    monkeypatch.setattr(movie_cache, "get_movie", slow_lookup)
+
+    start = time.monotonic()
+    result = streaming_picks.filter_by_availability([movie(1), movie(2), movie(3)], [8])
+    elapsed = time.monotonic() - start
+
+    assert elapsed < 1.5  # nowhere near the 2s the hung lookup actually takes
+    ids = {m["id"] for m in result}
+    assert 1 in ids  # resolved fast, genuinely available
+    assert 2 in ids  # never finished in time -> fails open, kept anyway
+    assert 3 not in ids  # resolved fast, genuinely unavailable

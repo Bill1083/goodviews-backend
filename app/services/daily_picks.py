@@ -31,6 +31,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import random
+import time
 from datetime import date, datetime, timedelta, timezone, tzinfo
 
 from app.services import streaming_picks, tmdb
@@ -338,11 +339,14 @@ def get_daily_picks(user_id: str, tz: tzinfo, force: bool = False, now: datetime
     return _hydrate(todays, supabase)
 
 
-# How many drop-and-refill rounds to try before settling for however many
-# picks ended up available — each round can replace several slots in one
-# get_daily_picks() call, so this bounds worst case to a handful of rounds
-# even with a very narrow provider selection, not an unbounded loop.
+# How many drop-and-refill rounds to try, and a hard wall-clock budget for
+# the whole loop — each round's own filter_by_availability call is already
+# bounded (see streaming_picks._AVAILABILITY_BUDGET_SECONDS), but several
+# rounds of that can still add up past the client's own request timeout on
+# a bad run, so this is the belt to that braces: stop starting new rounds
+# once the budget is spent and settle for however many ended up available.
 _STREAMING_BACKFILL_MAX_ROUNDS = 4
+_STREAMING_BACKFILL_DEADLINE_SECONDS = 6.0
 
 
 def get_daily_picks_streaming(user_id: str, tz: tzinfo, provider_ids: list[int], force: bool = False) -> dict:
@@ -357,7 +361,10 @@ def get_daily_picks_streaming(user_id: str, tz: tzinfo, provider_ids: list[int],
         return data
 
     supabase = get_supabase()
+    deadline = time.monotonic() + _STREAMING_BACKFILL_DEADLINE_SECONDS
     for _ in range(_STREAMING_BACKFILL_MAX_ROUNDS):
+        if time.monotonic() >= deadline:
+            break
         kept = streaming_picks.filter_by_availability(data["results"], provider_ids)
         if len(kept) >= len(data["results"]):
             data["results"] = kept
