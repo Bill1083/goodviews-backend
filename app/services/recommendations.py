@@ -93,7 +93,7 @@ def get_recommendations_for_user(user_id: str, force: bool = False) -> dict:
 # is spent and return whatever fits by then, rather than let it compound.
 _STREAMING_BACKFILL_BATCH = 6
 _STREAMING_BACKFILL_MAX_ROUNDS = 6
-_STREAMING_BACKFILL_DEADLINE_SECONDS = 6.0
+_STREAMING_BACKFILL_DEADLINE_SECONDS = 3.5
 
 
 def get_recommendations_for_user_streaming(user_id: str, provider_ids: list[int], force: bool = False) -> dict:
@@ -133,7 +133,7 @@ def get_recommendations_for_user_streaming(user_id: str, provider_ids: list[int]
                 batch.append(candidate)
                 excluded_ids.add(candidate["movie_id"])
         if not batch:
-            batch = _backfill_items(excluded_ids, _STREAMING_BACKFILL_BATCH, supabase)
+            batch = _backfill_items(excluded_ids, _STREAMING_BACKFILL_BATCH, supabase, deadline=deadline)
             if not batch:
                 break
             excluded_ids |= {b["movie_id"] for b in batch}
@@ -312,18 +312,28 @@ def _upsert_movie_stub(m: dict) -> dict:
     }
 
 
-def _backfill_items(exclude_ids: set[int], limit: int, supabase) -> list[dict]:
+def _backfill_items(exclude_ids: set[int], limit: int, supabase, deadline: float | None = None) -> list[dict]:
     """Cold-start / not-enough-candidates safety net: TMDB's global top-rated
     list, minus anything already excluded. Persists stubs so _hydrate can
     find these movies afterward (browsing the plain Top Rated tab never
     writes into the movies table, unlike viewing/reviewing a movie). Also
     used as the single-replacement picker for mark_not_interested (limit=1)
-    and as the last resort for Movies of the Day."""
+    and as the last resort for Movies of the Day.
+
+    `deadline` (a time.monotonic() cutoff) is optional and only passed by
+    the streaming-filter callers below — each page fetch is already bounded
+    to ~10s by tmdb._tmdb_get's own retry deadline, but this function could
+    otherwise attempt up to 3 of those in a row with nothing stopping it;
+    the deadline, checked between pages (not able to abort an
+    already-in-flight one), is what keeps that from compounding past
+    whatever overall budget the caller is working to."""
     items: list[dict] = []
     stubs: list[dict] = []
     seen: set[int] = set()
     page = 1
     while len(items) < limit and page <= 3:
+        if deadline is not None and time.monotonic() >= deadline:
+            break
         try:
             data = tmdb.get_top_rated_movies(page)
         except Exception:

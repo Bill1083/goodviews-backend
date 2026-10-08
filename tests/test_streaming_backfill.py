@@ -3,6 +3,8 @@ films show in For You / Movies of the Day, not how many — both feeds
 backfill from the same reservoirs their own dismiss mechanics already use
 (see recommendations.get_recommendations_for_user_streaming and
 daily_picks.get_daily_picks_streaming)."""
+import time
+
 import pytest
 
 from app import create_app
@@ -91,7 +93,7 @@ def test_falls_back_to_generic_backfill_once_overflow_is_exhausted(app_ctx, monk
     monkeypatch.setattr(streaming_picks, "filter_by_availability", available_only)
     db = FakeSupabase({"user_recommendations": feed_row([1, 2], overflow=[4, 6])})  # overflow has nothing available
     monkeypatch.setattr(recommendations, "get_supabase", lambda: db)
-    monkeypatch.setattr(recommendations, "_backfill_items", lambda exclude_ids, limit, supabase: [{"movie_id": 99, "reason": "Popular right now"}])
+    monkeypatch.setattr(recommendations, "_backfill_items", lambda exclude_ids, limit, supabase, deadline=None: [{"movie_id": 99, "reason": "Popular right now"}])
 
     result = recommendations.get_recommendations_for_user_streaming("u1", [8], force=False)
     ids = {m["id"] for m in result["results"]}
@@ -119,7 +121,7 @@ def test_a_hopeless_selection_terminates_rather_than_hanging(app_ctx, monkeypatc
     monkeypatch.setattr(streaming_picks, "filter_by_availability", available_only)
     db = FakeSupabase({"user_recommendations": feed_row([2, 4], overflow=[6, 8, 10, 12])})
     monkeypatch.setattr(recommendations, "get_supabase", lambda: db)
-    monkeypatch.setattr(recommendations, "_backfill_items", lambda exclude_ids, limit, supabase: [])
+    monkeypatch.setattr(recommendations, "_backfill_items", lambda exclude_ids, limit, supabase, deadline=None: [])
 
     result = recommendations.get_recommendations_for_user_streaming("u1", [8], force=False)
     assert result["results"] == []
@@ -170,3 +172,22 @@ def test_daily_a_hopeless_selection_terminates_rather_than_hanging(app_ctx, monk
     result = daily_picks.get_daily_picks_streaming("u1", object(), [8], force=False)
     assert result["results"] == []
     assert result["total_results"] == 0
+
+
+# ─── _backfill_items' own deadline ────────────────────────────────────────────
+
+def test_backfill_items_stops_calling_tmdb_once_past_its_deadline(app_ctx, monkeypatch):
+    """The gap that let a single streaming-filtered request run far longer
+    than intended even with filter_by_availability itself bounded:
+    _backfill_items could still attempt up to 3 TMDB top-rated pages with
+    nothing stopping it, each able to take ~10s on its own (TMDB's own
+    retry deadline) if the connection-reset flakiness documented in
+    tmdb._tmdb_get was in play. A deadline already in the past means it
+    shouldn't even attempt page 1."""
+    calls = []
+    monkeypatch.setattr(recommendations.tmdb, "get_top_rated_movies", lambda page=1: (calls.append(page), {"results": [movie(100 + page)]})[1])
+
+    result = recommendations._backfill_items(set(), 10, object(), deadline=time.monotonic() - 1)
+
+    assert calls == []
+    assert result == []

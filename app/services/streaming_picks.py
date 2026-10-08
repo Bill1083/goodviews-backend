@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 # (up to 6 retries, 10s deadline *per movie* — see tmdb._DEADLINE_SECONDS)
 # could collectively take far longer than the client's own request
 # timeout, which is exactly what "nothing ever loaded" was.
-_AVAILABILITY_BUDGET_SECONDS = 3.0
+_AVAILABILITY_BUDGET_SECONDS = 2.5
 
 # Matches the region MovieDetailModal's own WatchProvidersModal already uses
 # (see client/src/components/MovieDetailModal.tsx) — one region for now,

@@ -346,7 +346,7 @@ def get_daily_picks(user_id: str, tz: tzinfo, force: bool = False, now: datetime
 # a bad run, so this is the belt to that braces: stop starting new rounds
 # once the budget is spent and settle for however many ended up available.
 _STREAMING_BACKFILL_MAX_ROUNDS = 4
-_STREAMING_BACKFILL_DEADLINE_SECONDS = 6.0
+_STREAMING_BACKFILL_DEADLINE_SECONDS = 3.5
 
 
 def get_daily_picks_streaming(user_id: str, tz: tzinfo, provider_ids: list[int], force: bool = False) -> dict:
