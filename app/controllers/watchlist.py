@@ -114,6 +114,25 @@ def add_to_watchlist():
             pass
 
     try:
+        # A film you've already reviewed shouldn't land back in "want to
+        # watch" — creating a review already removes it from here for the
+        # same reason (see reviews.create_review's auto-remove). This is
+        # the other direction: e.g. adding a friend's recommendation after
+        # you've already watched and reviewed that film yourself. A 409
+        # (rather than a silent 200 no-op) so an optimistic "added!" on the
+        # client rolls back instead of quietly leaving a film marked both
+        # watched and want-to-watch.
+        already_reviewed = (
+            supabase.table("reviews")
+            .select("id")
+            .eq("user_id", str(user.id))
+            .eq("movie_id", movie_id)
+            .limit(1)
+            .execute()
+        )
+        if already_reviewed.data:
+            return jsonify({"error": "Already reviewed — not added to watchlist", "already_reviewed": True}), 409
+
         existing = (
             supabase.table("watchlist")
             .select("movie_id")
