@@ -187,6 +187,71 @@ def test_padding_gives_up_at_its_deadline_rather_than_hang(app_ctx, monkeypatch)
     assert len(out["popular"]) < streaming_worlds.TARGET_POOL_SIZE  # gave up short rather than hang for it
 
 
+def test_already_reviewed_films_are_excluded_from_personal_sections_only(app_ctx, monkeypatch):
+    """Popular stays a general "what's trending" row (same as Most Popular
+    This Week never filtering by personal history) — only For You and
+    Different, which are personal picks, drop films the user has already
+    reviewed."""
+    from types import SimpleNamespace
+
+    signals = SimpleNamespace(reviewed_ids={2}, genre_affinity={}, onboarding_genre_ids=[])
+    monkeypatch.setattr(streaming_worlds, "_load_user_signals", lambda user_id, supabase: signals)
+    monkeypatch.setattr(streaming_worlds, "_affinity_genres", lambda s: ([28], [12]))
+
+    def by_params(params):
+        if params.get("sort_by") == "popularity.desc" and params.get("page", 1) == 1:
+            return [movie(1), movie(2), movie(3)]  # movie 2 is "already seen"
+        if params.get("with_genres") == "28":
+            return [movie(2), movie(4)]  # the For You genre call also turns it up
+        if params.get("with_genres") == "12":
+            return [movie(2), movie(5)]  # so does Different's
+        return []
+
+    install(monkeypatch, by_params=by_params)
+    out = streaming_worlds.get_streaming_world("u1", 8)
+
+    assert 2 in {m["id"] for m in out["popular"]}  # Popular isn't filtered by "already seen"
+    assert 2 not in {m["id"] for m in out["for_you"]}
+    assert 2 not in {m["id"] for m in out["different"]}
+    assert 4 in {m["id"] for m in out["for_you"]}
+    assert 5 in {m["id"] for m in out["different"]}
+
+
+def test_padding_also_skips_already_reviewed_films_for_personal_sections(app_ctx, monkeypatch):
+    """The shared filler cursor that tops sections up to TARGET_POOL_SIZE
+    (see test_short_pools_are_padded...) must apply the same "already seen"
+    rule as the main genre-scoped calls when it's filling For You."""
+    from types import SimpleNamespace
+
+    signals = SimpleNamespace(reviewed_ids={999}, genre_affinity={}, onboarding_genre_ids=[])
+    monkeypatch.setattr(streaming_worlds, "_load_user_signals", lambda user_id, supabase: signals)
+    monkeypatch.setattr(streaming_worlds, "_affinity_genres", lambda s: ([28], [12]))
+
+    def by_params(params):
+        if params.get("sort_by") == "popularity.desc" and params.get("page", 1) == 1:
+            return [movie(mid) for mid in range(1, 21)]  # Popular already full — no padding needed
+        if params.get("with_genres") == "28":
+            return []  # For You's own genre call comes up empty — padding does all the work
+        if params.get("with_genres") == "12":
+            # Different gets a handful from its own genre call, so it never
+            # hits its own page=2 fallback below — keeps this test isolated
+            # to the shared padding filler, which is what's under test.
+            return [movie(mid) for mid in range(3000, 3006)]
+        if params.get("page") == 2:
+            # Filler page: one already-reviewed id (999) mixed in with fresh ones.
+            return [movie(999)] + [movie(mid) for mid in range(2000, 2020)]
+        return []
+
+    install(monkeypatch, by_params=by_params)
+    out = streaming_worlds.get_streaming_world("u1", 8)
+
+    assert 999 not in {m["id"] for m in out["for_you"]}
+    assert len(out["for_you"]) == streaming_worlds.TARGET_POOL_SIZE
+    # Popular never needed padding (page 1 alone already filled it) — included here
+    # mainly to pin down that it's unaffected by any of this, not just For You.
+    assert {m["id"] for m in out["popular"]} == set(range(1, 21))
+
+
 def test_route_rejects_an_out_of_range_provider_id(monkeypatch):
     from types import SimpleNamespace
 

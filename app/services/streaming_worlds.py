@@ -51,7 +51,7 @@ _DISCOVER_BASE = {
 }
 
 
-def _discover(provider_id: int, params: dict) -> list[dict]:
+def _discover(provider_id: int, params: dict, exclude_ids: set[int] | None = None) -> list[dict]:
     try:
         data = tmdb.discover_movies({
             **_DISCOVER_BASE,
@@ -62,7 +62,10 @@ def _discover(provider_id: int, params: dict) -> list[dict]:
     except Exception:
         logger.exception("Streaming-world discover failed for provider %s params %s", provider_id, params)
         return []
-    return [m for m in data.get("results", []) if m.get("id") and m.get("title") and m.get("poster_path")]
+    results = [m for m in data.get("results", []) if m.get("id") and m.get("title") and m.get("poster_path")]
+    if exclude_ids:
+        results = [m for m in results if m["id"] not in exclude_ids]
+    return results
 
 
 def _affinity_genres(signals) -> tuple[list[int], list[int]]:
@@ -85,12 +88,21 @@ def get_streaming_world(user_id: str, provider_id: int) -> dict:
     """{"popular": [...], "for_you": [...], "different": [...]}, each a list
     of slim movie dicts (same shape as a /discover response's "results"),
     deduped against each other so the three rows don't just repeat the same
-    handful of blockbusters."""
+    handful of blockbusters. For You and Different also exclude anything the
+    user has already reviewed — Popular doesn't, by design (see `already_seen`
+    below)."""
     supabase = get_supabase()
     signals = _load_user_signals(user_id, supabase)
     for_you_genres, different_genres = _affinity_genres(signals)
 
     app = current_app._get_current_object()
+
+    # "Popular" deliberately ignores this — same reasoning as Most Popular
+    # This Week on the main Discover page: it's a general "what's trending"
+    # row, not a personal recommendation, so there's no "already seen" to
+    # apply. For You and Different are personal picks, where a film the
+    # user has already reviewed has nothing left to offer them.
+    already_seen = signals.reviewed_ids
 
     def _run(kind: str) -> tuple[str, list[dict]]:
         with app.app_context():
@@ -99,7 +111,11 @@ def get_streaming_world(user_id: str, provider_id: int) -> dict:
             genres = for_you_genres if kind == "for_you" else different_genres
             if not genres:
                 return kind, []
-            return kind, _discover(provider_id, {"with_genres": "|".join(str(g) for g in genres), "sort_by": "vote_average.desc"})
+            return kind, _discover(
+                provider_id,
+                {"with_genres": "|".join(str(g) for g in genres), "sort_by": "vote_average.desc"},
+                exclude_ids=already_seen,
+            )
 
     pools: dict[str, list[dict]] = {"popular": [], "for_you": [], "different": []}
     executor = ThreadPoolExecutor(max_workers=3)
@@ -125,9 +141,9 @@ def get_streaming_world(user_id: str, provider_id: int) -> dict:
     # catalog overlap on the chosen genres can leave for_you/different empty
     # — fall back to a well-rated general pool rather than a dead section.
     if not pools["for_you"]:
-        pools["for_you"] = _discover(provider_id, {"sort_by": "vote_average.desc"})
+        pools["for_you"] = _discover(provider_id, {"sort_by": "vote_average.desc"}, exclude_ids=already_seen)
     if not pools["different"]:
-        pools["different"] = _discover(provider_id, {"sort_by": "popularity.desc", "page": 2})
+        pools["different"] = _discover(provider_id, {"sort_by": "popularity.desc", "page": 2}, exclude_ids=already_seen)
 
     seen: set[int] = set()
     out: dict[str, list[dict]] = {}
@@ -161,11 +177,17 @@ def get_streaming_world(user_id: str, provider_id: int) -> dict:
         return filler.pop(0) if filler else None
 
     for kind in ("popular", "for_you", "different"):
+        exclude_seen = already_seen if kind != "popular" else None
         while len(out[kind]) < TARGET_POOL_SIZE:
             m = _next_filler()
             if m is None:
                 break
             seen.add(m["id"])
+            # Still consumed from the shared queue either way (it's a
+            # one-time list, not re-queryable) — just not handed to a
+            # personal section for a film already reviewed.
+            if exclude_seen and m["id"] in exclude_seen:
+                continue
             out[kind].append(m)
 
     stubs = [_upsert_movie_stub(m) for films in out.values() for m in films]
