@@ -33,7 +33,7 @@ from datetime import date
 
 from flask import current_app
 
-from app.services import streaming_picks, tmdb
+from app.services import cache, streaming_picks, tmdb
 from app.services.recommendations import (
     _load_user_signals,
     _upsert_movie_stub,
@@ -175,14 +175,38 @@ def _affinity_genres(signals) -> tuple[list[int], list[int]]:
     return onboarding[:3], onboarding[3:6]
 
 
+# Computing a world from scratch is several TMDB round trips (3 parallel
+# discover calls, sometimes a fallback and/or padding on top) — several
+# seconds worst case. Cached per (user, provider, day): a user reopening the
+# same service later the same day (or a friend on the same provider) gets
+# an instant cache hit instead of repaying that cost. Not actively
+# invalidated on a new review — same staleness tolerance already accepted
+# elsewhere in this codebase (recommendations.CACHE_TTL is also 24h) — a
+# review made today just doesn't get excluded from today's cached world
+# until it's recomputed tomorrow.
+_RESULT_CACHE_TTL_HOURS = 24
+
+
 def get_streaming_world(user_id: str, provider_id: int, day: date | None = None) -> dict:
     """{"popular": [...], "for_you": [...], "different": [...]}, each a list
-    of slim movie dicts (same shape as a /discover response's "results"),
-    deduped against each other so the three rows don't just repeat the same
-    handful of blockbusters. For You and Different also exclude anything the
-    user has already reviewed — Popular doesn't, by design (see `already_seen`
-    below)."""
+    of slim movie dicts (same shape as a /discover response's "results") —
+    see _compute_streaming_world for how it's built. This wrapper is just
+    the Redis read-through cache around that computation."""
     day = day or date.today()
+    cache_key = f"streaming_world:{user_id}:{provider_id}:{day.isoformat()}"
+    cached = cache.cache_get(cache_key)
+    if cached is not None:
+        return cached
+    result = _compute_streaming_world(user_id, provider_id, day)
+    cache.cache_set(cache_key, result, ttl=_RESULT_CACHE_TTL_HOURS * 3600)
+    return result
+
+
+def _compute_streaming_world(user_id: str, provider_id: int, day: date) -> dict:
+    """Deduped against each other so the three rows don't just repeat the
+    same handful of blockbusters. For You and Different also exclude
+    anything the user has already reviewed — Popular doesn't, by design
+    (see `already_seen` below)."""
     supabase = get_supabase()
     signals = _load_user_signals(user_id, supabase)
     for_you_genres, different_genres = _affinity_genres(signals)

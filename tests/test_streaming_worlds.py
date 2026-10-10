@@ -25,6 +25,19 @@ def app_ctx():
         yield
 
 
+@pytest.fixture(autouse=True)
+def no_redis(monkeypatch):
+    """get_streaming_world now wraps a Redis cache around
+    _compute_streaming_world (see streaming_worlds.py) — a per-test dict
+    store keeps every test's result independent and deterministic
+    regardless of whether a real Redis happens to be reachable, since many
+    tests below reuse the same (user_id, provider_id, day)."""
+    store: dict = {}
+    monkeypatch.setattr(streaming_worlds.cache, "cache_get", lambda key: store.get(key))
+    monkeypatch.setattr(streaming_worlds.cache, "cache_set", lambda key, value, ttl=None: store.__setitem__(key, value))
+    return store
+
+
 def fake_signals(**overrides) -> SimpleNamespace:
     """A minimal stand-in for recommendations.UserSignals, carrying only the
     fields streaming_worlds.py itself reads (reviewed_ids, genre_affinity,
@@ -303,10 +316,13 @@ def test_two_users_with_identical_genre_affinity_land_on_different_pages(app_ctx
     assert requested_pages[0] != requested_pages[1]
 
 
-def test_the_same_user_gets_a_stable_page_across_repeat_requests_on_the_same_day(app_ctx, monkeypatch):
+def test_the_same_user_gets_a_stable_page_across_repeat_requests_on_the_same_day(app_ctx, monkeypatch, no_redis):
     """Reloading the page shouldn't reshuffle it — same reasoning as
     daily_picks' "reloading doesn't reshuffle" guarantee, reused here via
-    the same seeded_rng helper."""
+    the same seeded_rng helper. Clears the result cache between calls so
+    this proves the underlying seeded_rng stability itself, independent of
+    the (separately tested) caching layer short-circuiting a second call
+    entirely."""
     monkeypatch.setattr(streaming_worlds, "_affinity_genres", lambda signals: ([28], []))
     requested_pages = []
 
@@ -318,10 +334,42 @@ def test_the_same_user_gets_a_stable_page_across_repeat_requests_on_the_same_day
 
     install(monkeypatch, by_params=by_params)
     streaming_worlds.get_streaming_world("user-a", 8, day=DAY)
+    no_redis.clear()
     streaming_worlds.get_streaming_world("user-a", 8, day=DAY)
 
     assert len(requested_pages) == 2
     assert requested_pages[0] == requested_pages[1]
+
+
+def test_a_repeat_request_is_served_from_cache_without_recomputing(app_ctx, monkeypatch):
+    """The actual point of caching this at all: a second request for the
+    same (user, provider, day) must not touch TMDB again."""
+    monkeypatch.setattr(streaming_worlds, "_affinity_genres", lambda signals: ([28], []))
+    call_count = []
+
+    def by_params(params):
+        call_count.append(1)
+        return [movie(mid) for mid in range(1, 21)]
+
+    install(monkeypatch, by_params=by_params)
+    first = streaming_worlds.get_streaming_world("user-a", 8, day=DAY)
+    calls_after_first = len(call_count)
+    second = streaming_worlds.get_streaming_world("user-a", 8, day=DAY)
+
+    assert len(call_count) == calls_after_first  # no new TMDB calls on the cache hit
+    assert second == first
+
+
+def test_a_different_provider_is_not_served_from_another_providers_cache(app_ctx, monkeypatch):
+    monkeypatch.setattr(streaming_worlds, "_affinity_genres", lambda signals: ([28], []))
+    call_count = []
+    install(monkeypatch, by_params=lambda params: call_count.append(1) or [movie(mid) for mid in range(1, 21)])
+
+    streaming_worlds.get_streaming_world("user-a", 8, day=DAY)
+    calls_after_first = len(call_count)
+    streaming_worlds.get_streaming_world("user-a", 9, day=DAY)  # different provider — must recompute, not reuse #8's cache
+
+    assert len(call_count) > calls_after_first
 
 
 def test_a_different_day_can_land_on_a_different_page_for_the_same_user(app_ctx, monkeypatch):
