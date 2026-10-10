@@ -7,6 +7,7 @@ from typing import Any
 from flask import current_app
 
 from app.services import tmdb
+from app.services.collection_ordering import order_collection_parts
 from app.services.pg import chunked, paginate
 from app.services.supabase_client import get_supabase
 
@@ -427,3 +428,68 @@ def get_movie_images(movie_id: int) -> dict:
     import movie_cache for movie_id-keyed data rather than app.services.tmdb
     directly. The images gallery stays Redis-backed — see tmdb.py."""
     return tmdb.get_movie_images(movie_id)
+
+
+def _slim_collection_part(p: dict) -> dict:
+    """Same slim movie-tile shape used throughout the app (e.g.
+    streaming_worlds._slim) — matches the frontend Movie type exactly, so
+    the collection endpoint needs no new TS type for its `parts` array."""
+    return {
+        "id": p["id"],
+        "title": p.get("title"),
+        "poster_path": p.get("poster_path"),
+        "backdrop_path": p.get("backdrop_path"),
+        "release_date": p.get("release_date"),
+        "vote_average": p.get("vote_average") or 0,
+        "genre_ids": p.get("genre_ids") or [],
+    }
+
+
+def get_movie_collection(movie_id: int) -> dict:
+    """{"collection": None} when the movie has no franchise, else
+    {"collection": {id, name, poster_path, backdrop_path, parts}}, parts
+    ordered sequels/prequels-first (see app.services.collection_ordering).
+
+    Reads collection_id off the already-persisted movies row first — zero
+    TMDB calls for the common case, since the modal's own GET /<id> details
+    fetch already ran get_movie() and populated that column (sql/008)
+    before this endpoint is ever called."""
+    supabase = get_supabase()
+
+    def _lookup() -> dict | None:
+        result = (
+            supabase.table("movies")
+            .select("collection_id, collection_name, title")
+            .eq("id", movie_id)
+            .limit(1)
+            .execute()
+        )
+        return result.data[0] if result.data else None
+
+    row = _lookup()
+    if row is None:
+        # Never fetched at all (e.g. a cold id hit directly) — one full
+        # core-segment fetch the normal way; not the expected path, since
+        # the modal always fetches GET /<id> first.
+        get_movie(movie_id, segments=("core",))
+        row = _lookup()
+
+    collection_id = row.get("collection_id") if row else None
+    if not collection_id:
+        return {"collection": None}
+
+    data = tmdb.get_collection_details(collection_id)
+    parts = [
+        p for p in (data.get("parts") or [])
+        if p.get("id") and p.get("id") != movie_id and p.get("title")
+    ]
+    ordered = order_collection_parts(parts, seed_title=row.get("title") or "")
+    return {
+        "collection": {
+            "id": data.get("id"),
+            "name": data.get("name"),
+            "poster_path": data.get("poster_path"),
+            "backdrop_path": data.get("backdrop_path"),
+            "parts": [_slim_collection_part(p) for p in ordered],
+        }
+    }

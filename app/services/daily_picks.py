@@ -44,6 +44,7 @@ from app.services.recommendations import (
     _load_user_signals,
     _upsert_movie_stub,
 )
+from app.services.seeded_rng import seeded_rng as _rng
 from app.services.supabase_client import get_supabase
 
 logger = logging.getLogger(__name__)
@@ -87,12 +88,6 @@ def _phase(user_id: str) -> int:
 def day_kind(user_id: str, day: date) -> str:
     """'branch' every two or three days, alternating; otherwise 'shuffle'."""
     return "branch" if (day.toordinal() + _phase(user_id)) % BRANCH_CYCLE in BRANCH_POSITIONS else "shuffle"
-
-
-def _rng(user_id: str, day: date, salt: str) -> random.Random:
-    # random.Random seeded with a str is stable across processes (it hashes
-    # the seed with SHA-512), unlike hash()-based seeds.
-    return random.Random(f"{user_id}:{day.isoformat()}:{salt}")
 
 
 # ─── Shuffle days ────────────────────────────────────────────────────────────

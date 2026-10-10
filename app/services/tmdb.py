@@ -221,6 +221,24 @@ def get_watch_providers_list(region: str) -> dict:
     return data
 
 
+def get_collection_details(collection_id: int) -> dict:
+    """A TMDB "collection" (franchise) — {id, name, overview, poster_path,
+    backdrop_path, parts}, parts being every film TMDB has filed under this
+    collection, unordered and with no relation-type field (sequel vs.
+    spin-off vs. short isn't a thing TMDB tracks — see
+    app.services.collection_ordering). Collection membership only changes
+    when TMDB catalogers file a new sequel, which happens on the order of
+    months — cached longer than anything else in this file."""
+    cache_key = f"tmdb:collection:{collection_id}"
+    cached = _cache_get(cache_key)
+    if cached:
+        return cached
+    data = _tmdb_get(f"/collection/{collection_id}")
+    ttl = current_app.config["COLLECTION_TTL_DAYS"] * 86400
+    _cache_set(cache_key, data, ttl=ttl)
+    return data
+
+
 def search_people(query: str, page: int = 1) -> dict:
     data = _cached_search(
         _search_key("people:search", query, page),

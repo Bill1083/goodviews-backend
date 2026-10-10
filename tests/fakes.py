@@ -34,6 +34,22 @@ class FakeQuery:
         self.filters.append((col, None if val == "null" else val))
         return self
 
+    def gte(self, col, val):
+        self.filters.append((col, ("gte", val)))
+        return self
+
+    def lte(self, col, val):
+        self.filters.append((col, ("lte", val)))
+        return self
+
+    def gt(self, col, val):
+        self.filters.append((col, ("gt", val)))
+        return self
+
+    def lt(self, col, val):
+        self.filters.append((col, ("lt", val)))
+        return self
+
     def limit(self, _n):
         return self
 
@@ -69,6 +85,19 @@ class FakeQuery:
             elif val is None:
                 if row.get(col) is not None:
                     return False
+            elif isinstance(val, tuple) and len(val) == 2 and val[0] in ("gte", "lte", "gt", "lt"):
+                op, bound = val
+                actual = row.get(col)
+                if actual is None:
+                    return False
+                if op == "gte" and not actual >= bound:
+                    return False
+                if op == "lte" and not actual <= bound:
+                    return False
+                if op == "gt" and not actual > bound:
+                    return False
+                if op == "lt" and not actual < bound:
+                    return False
             elif str(row.get(col)) != str(val):
                 return False
         return True
@@ -97,10 +126,12 @@ class FakeQuery:
 
         if self.op == "update":
             self._check_columns(self.payload)
+            updated = []
             for r in rows:
                 if self._matches(r):
                     r.update(self.payload)
-            return FakeResult([])
+                    updated.append(dict(r))
+            return FakeResult(updated)
 
         if self.op == "insert":
             payload = self.payload if isinstance(self.payload, list) else [self.payload]

@@ -17,6 +17,11 @@ class Config:
     MOVIE_MEDIA_TTL_DAYS = int(os.getenv("MOVIE_MEDIA_TTL_DAYS", 10))            # posters/trailers: 7-14d
     MOVIE_PROVIDERS_TTL_HOURS = int(os.getenv("MOVIE_PROVIDERS_TTL_HOURS", 24))  # watch providers: 24-48h
 
+    # A franchise's movie list — close to static (a new entry only appears
+    # when TMDB catalogers file an upcoming sequel), so cached longer than
+    # anything else movie-related here.
+    COLLECTION_TTL_DAYS = int(os.getenv("COLLECTION_TTL_DAYS", 14))
+
     # How long the curated streaming-provider list itself (names/logos/ids)
     # is cached — this changes rarely, so a long TTL is fine.
     STREAMING_PROVIDERS_TTL_HOURS = int(os.getenv("STREAMING_PROVIDERS_TTL_HOURS", 24 * 7))

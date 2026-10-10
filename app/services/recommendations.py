@@ -1,12 +1,16 @@
 import logging
+import math
+import re
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from flask import current_app
 
 from app.services import movie_cache, streaming_picks, tmdb
+from app.services.seeded_rng import seeded_rng
 from app.services.supabase_client import get_supabase
 
 logger = logging.getLogger(__name__)
@@ -41,6 +45,18 @@ _ONBOARDING_GENRE_BONUS = 1.5
 _FRIEND_BOOST_PER_FRIEND = 2.0
 _PROVENANCE_BONUS = {"seed_rec": 0.5, "favourite": 0.3, "friend": 0.4, "diversity": 0.1}
 _VOTE_AVERAGE_WEIGHT = 0.1
+# Comparable scale to a single genre's typical genre_affinity contribution —
+# a tuning knob, not derived from anything; revisit once there's real usage
+# data on how this content signal behaves (see build_taste_profile_terms).
+_OVERVIEW_SIMILARITY_WEIGHT = 2.0
+
+
+def _weight(rating: float, rewatch_count: int) -> float:
+    bucket = 5 if rating >= 4.5 else (4 if rating >= 4 else 3)
+    w = _POSITIVE_WEIGHT[bucket]
+    if rewatch_count:
+        w += _REWATCH_BONUS
+    return w
 
 # "Not interested in these types of movies": demotes candidates in proportion
 # to how closely their overall profile matches the dismissed movie, rather
@@ -278,6 +294,7 @@ def _fetch_credits(movie_ids: list[int]) -> dict[int, dict]:
             "person_ids": cast_ids + director_ids,
             "director_ids": director_ids,
             "vote_average": data.get("vote_average") or 0,
+            "overview": data.get("overview"),
         }
 
     out: dict[int, dict] = {}
@@ -458,13 +475,6 @@ def _load_user_signals(user_id: str, supabase) -> UserSignals:
     genre_penalty: dict[int, float] = {}
     person_penalty: dict[int, float] = {}
 
-    def _weight(rating: float, rewatch_count: int) -> float:
-        bucket = 5 if rating >= 4.5 else (4 if rating >= 4 else 3)
-        w = _POSITIVE_WEIGHT[bucket]
-        if rewatch_count:
-            w += _REWATCH_BONUS
-        return w
-
     for r in positive_seeds + diversity_seeds:
         info = seed_info.get(r["movie_id"])
         if not info:
@@ -512,12 +522,82 @@ def _load_user_signals(user_id: str, supabase) -> UserSignals:
     )
 
 
+# A short hand-rolled stopword list rather than a dependency — movie
+# overviews are short marketing blurbs, not prose that needs real NLP; the
+# goal is just to stop "a", "the", "and" from dominating every profile.
+_STOPWORDS = frozenset({
+    "a", "an", "the", "and", "or", "but", "of", "in", "on", "at", "to", "for",
+    "with", "from", "by", "is", "are", "was", "were", "be", "been", "being",
+    "as", "it", "its", "his", "her", "their", "he", "she", "they", "this",
+    "that", "these", "those", "who", "when", "where", "which", "while",
+    "after", "before", "into", "about", "up", "down", "out", "if", "than",
+    "so", "not", "no", "has", "have", "had", "will", "can", "must", "one",
+    "all", "there", "them", "him", "you", "your", "what", "how", "now",
+})
+_WORD_RE = re.compile(r"[a-z]+")
+
+
+def _tokenize(text: str) -> list[str]:
+    return [w for w in _WORD_RE.findall(text.lower()) if len(w) > 2 and w not in _STOPWORDS]
+
+
+def build_taste_profile_terms(signals: UserSignals) -> Counter | None:
+    """A bag-of-words term-frequency profile built from the overview text of
+    the user's own positively-rated seed movies (positive_seeds +
+    diversity_seeds — never negative_seeds, which would pull the profile
+    toward what the user disliked), weighted the same way genre_affinity is
+    (see _weight). This is the content signal that lets two users with an
+    identical top-3 genre ranking still get differently-ranked results,
+    without asking either of them to type anything — it's built entirely
+    from movies they've already rated.
+
+    Returns None — not an empty-but-valid Counter — when there's no overview
+    text to build from at all (a true cold start, or seeds whose cached rows
+    predate the overview column ever being fetched). Callers must treat None
+    as "no content signal available" and fall back to genre/popularity
+    ranking alone, not score every candidate 0.0 against an empty profile."""
+    terms: Counter = Counter()
+    for r in signals.positive_seeds + signals.diversity_seeds:
+        info = signals.seed_info.get(r["movie_id"])
+        overview = info.get("overview") if info else None
+        if not overview:
+            continue
+        w = _weight(r["rating"], r.get("rewatch_count") or 0)
+        for word in _tokenize(overview):
+            terms[word] += w
+    return terms or None
+
+
+def overview_similarity(profile_terms: Counter | None, candidate_overview: str | None) -> float:
+    """Cosine similarity in [0, 1] between a user's taste-profile term
+    counts and one candidate movie's overview text — plain dict/Counter dot
+    product and L2 norm, no numpy: at this app's scale (a handful of seeds,
+    a couple dozen candidates per discover call) that's sub-millisecond and
+    needs no new dependency. 0.0 whenever either side is missing/empty —
+    never raises, so a candidate with no overview just scores 0 on this
+    term rather than being excluded."""
+    if not profile_terms or not candidate_overview:
+        return 0.0
+    candidate_terms = Counter(_tokenize(candidate_overview))
+    if not candidate_terms:
+        return 0.0
+    dot = sum(count * candidate_terms[term] for term, count in profile_terms.items() if term in candidate_terms)
+    if dot <= 0:
+        return 0.0
+    profile_norm = math.sqrt(sum(v * v for v in profile_terms.values()))
+    candidate_norm = math.sqrt(sum(v * v for v in candidate_terms.values()))
+    if profile_norm == 0 or candidate_norm == 0:
+        return 0.0
+    return dot / (profile_norm * candidate_norm)
+
+
 def _generate_candidates(
     user_id: str,
     supabase,
     signals: UserSignals,
     exclude_watchlist: bool,
     extra_excluded_ids: frozenset = frozenset(),
+    day: date | None = None,
 ) -> tuple[dict[int, dict], dict[int, list[tuple[str, float]]], set[int]]:
     """Candidate generation + friend signal + enrichment for For You. Returns
     (candidates, friend_positive, excluded_ids) — the caller uses excluded_ids
@@ -546,6 +626,10 @@ def _generate_candidates(
                 "vote_average": m.get("vote_average") or 0,
                 "genre_ids": m.get("genre_ids") or [],
                 "person_ids": [],
+                # Already on every TMDB list-response item at zero extra
+                # cost — carried through to _score_candidates for the
+                # content-similarity term (see build_taste_profile_terms).
+                "overview": m.get("overview"),
             }
 
     # Each of these is its own TMDB call (with its own internal retry/backoff
@@ -571,7 +655,22 @@ def _generate_candidates(
         tasks.append(("diversity", r["movie_id"], title))
     # Onboarding genre picks are an explicit preference signal like
     # favourites, not tied to review count — a user who only did step 1
-    # still gets some personalization instead of pure backfill.
+    # still gets some personalization instead of pure backfill. Unlike
+    # seed_rec/favourite_actor/favourite_director (each keyed on the user's
+    # own specific movie/person ids, already individualized), this call is
+    # keyed only on a genre id from a small shared catalog (~19 genres) — any
+    # two users with the same onboarding picks would otherwise get a
+    # byte-identical query and byte-identical results, the same collision
+    # streaming_worlds.py's For You/Different had. Page and sort_by are
+    # randomized per (user, day, genre) — seeded, not reshuffled on every
+    # reload — chosen up front (not inside the parallel _run_task below) so
+    # the shared random.Random instance is never touched from more than one
+    # thread at a time.
+    _genre_fallback_rng = seeded_rng(user_id, day or date.today(), "for_you_genre_fallback")
+    genre_fallback_choices: dict[int, tuple[int, str]] = {
+        gid: (_genre_fallback_rng.randint(1, 3), _genre_fallback_rng.choice(("popularity.desc", "vote_average.desc")))
+        for gid in signals.onboarding_genre_ids[:3]
+    }
     for gid in signals.onboarding_genre_ids[:3]:
         genre_name = movie_cache.GENRE_MAP.get(gid, "that genre")
         tasks.append(("favourite_genre", gid, genre_name))
@@ -593,8 +692,9 @@ def _generate_candidates(
                         {"with_crew": key, "sort_by": "vote_average.desc", "vote_count.gte": 100}
                     )
                 else:
+                    page, sort_by = genre_fallback_choices.get(key, (1, "popularity.desc"))
                     data = tmdb.discover_movies(
-                        {"with_genres": key, "sort_by": "popularity.desc", "vote_count.gte": 100}
+                        {"with_genres": key, "sort_by": sort_by, "vote_count.gte": 100, "page": page}
                     )
             except Exception:
                 data = {}
@@ -689,6 +789,7 @@ def _generate_candidates(
         c["genre_ids"] = info["genre_ids"] or c["genre_ids"]
         c["person_ids"] = info["person_ids"]
         c["director_ids"] = info["director_ids"]
+        c["overview"] = c.get("overview") or info.get("overview")
         if not c["vote_average"]:
             c["vote_average"] = info["vote_average"]
 
@@ -720,6 +821,7 @@ def _score_candidates(
     candidates: dict[int, dict],
     signals: UserSignals,
     friend_positive: dict[int, list[tuple[str, float]]],
+    profile_terms: Counter | None = None,
 ) -> list[tuple[int, float, dict]]:
     scored: list[tuple[int, float, dict]] = []
     for mid, c in candidates.items():
@@ -728,6 +830,13 @@ def _score_candidates(
             score += signals.genre_affinity.get(gid, 0) - signals.genre_penalty.get(gid, 0)
         for pid in c["person_ids"]:
             score += signals.person_affinity.get(pid, 0) - signals.person_penalty.get(pid, 0)
+        # Content-based signal from the user's own rated movies' overview
+        # text — not genre tags, not anything they typed — so two users who
+        # share a genre/person profile but like differently-themed films
+        # still diverge. 0 contribution (not a penalty) whenever there's no
+        # profile or the candidate has no overview; see overview_similarity.
+        if profile_terms:
+            score += _OVERVIEW_SIMILARITY_WEIGHT * overview_similarity(profile_terms, c.get("overview"))
         # Applies whenever a friend rated this movie highly, regardless of
         # provenance — a movie already found via seed_rec/favourite that a
         # friend also loved should get credit for that too, not just the
@@ -771,7 +880,7 @@ def _spread_by_reason(items: list[dict]) -> list[dict]:
     return result
 
 
-def _compute(user_id: str, supabase) -> tuple[list[dict], list[dict]]:
+def _compute(user_id: str, supabase, day: date | None = None) -> tuple[list[dict], list[dict]]:
     """Returns (items, overflow) — overflow is the next best-scored-but-not-
     selected candidates (rank order, capped to OVERFLOW_SIZE), persisted
     alongside items so mark_not_interested can promote a real algorithmic
@@ -789,12 +898,14 @@ def _compute(user_id: str, supabase) -> tuple[list[dict], list[dict]]:
         return items, []
 
     candidates, friend_positive, excluded_ids = _generate_candidates(
-        user_id, supabase, signals, exclude_watchlist=True, extra_excluded_ids=signals.dismissed_ids
+        user_id, supabase, signals, exclude_watchlist=True, extra_excluded_ids=signals.dismissed_ids, day=day
     )
     if not candidates:
         return _backfill_items(excluded_ids, FEED_SIZE, supabase), []
 
-    scored = _score_candidates(candidates, signals, friend_positive)
+    profile_terms = build_taste_profile_terms(signals)
+
+    scored = _score_candidates(candidates, signals, friend_positive, profile_terms)
     if not scored:
         return _backfill_items(excluded_ids, FEED_SIZE, supabase), []
 

@@ -139,7 +139,12 @@ def friends_recent_activity():
             .execute()
         )
 
-        # Group by friend
+        # Group by friend, deduping each friend's list by movie — a stray
+        # second review row for the same (friend, movie) (e.g. from a
+        # double-submit; see create_review's own guard against that) would
+        # otherwise render as two identical tiles. Results are already
+        # ordered by created_at desc, so keeping the first occurrence per
+        # movie keeps the most recent one.
         by_friend: dict = {}
         for r in reviews_result.data:
             uid = r["user_id"]
@@ -148,8 +153,17 @@ def friends_recent_activity():
                     "friend_id": uid,
                     "username": friend_map.get(uid, "Unknown"),
                     "reviews": [],
+                    "_seen_movie_ids": set(),
                 }
-            by_friend[uid]["reviews"].append(r)
+            bucket = by_friend[uid]
+            movie_id = r["movie_id"]
+            if movie_id in bucket["_seen_movie_ids"]:
+                continue
+            bucket["_seen_movie_ids"].add(movie_id)
+            bucket["reviews"].append(r)
+
+        for bucket in by_friend.values():
+            del bucket["_seen_movie_ids"]
 
         # Return only friends who have at least one review
         result = [v for v in by_friend.values() if v["reviews"]]

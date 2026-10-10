@@ -10,15 +10,37 @@ provider scoping happens *at the source*, in one call per pool. That sidesteps
 the whole class of bug the main filter needed several rounds to fix (see
 streaming_picks.py's docstring and recommendations._backfill_items' deadline
 param) — there's no N+1 here to bound in the first place.
+
+For You and Different used to be a single deterministic discover call each
+(fixed sort_by, always page 1) keyed only on a bucketed top-3/next-3 slice of
+the user's genre_affinity — a ~19-genre space. Any two users who landed on the
+same ordered genre tuple (easy, especially via the onboarding-genre fallback
+for a thin review history) got a byte-identical query and byte-identical
+results. Both sections now (a) draw from a per-(user, day, provider, section)
+randomized page/sort, same seeding technique as daily_picks.py's Movies of the
+Day, and (b) re-rank whatever TMDB returns by a blend of genre match, overview-
+text similarity to the user's own highly-rated movies (see
+recommendations.build_taste_profile_terms — no typed-in user input, just their
+existing reviews), and popularity. Popular is deliberately left untouched: it's
+a shared "what's trending here" row, not a personal one, so staying identical
+across users is correct, not a bug.
 """
 import logging
+import random
 import time
 from concurrent.futures import ThreadPoolExecutor, wait
+from datetime import date
 
 from flask import current_app
 
 from app.services import streaming_picks, tmdb
-from app.services.recommendations import _load_user_signals, _upsert_movie_stub
+from app.services.recommendations import (
+    _load_user_signals,
+    _upsert_movie_stub,
+    build_taste_profile_terms,
+    overview_similarity,
+)
+from app.services.seeded_rng import seeded_rng, weighted_sample
 from app.services.supabase_client import get_supabase
 
 logger = logging.getLogger(__name__)
@@ -50,22 +72,91 @@ _DISCOVER_BASE = {
     "vote_count.gte": 50,
 }
 
+# How many of the first TMDB result pages a For You/Different discover call
+# may land on, and which sort it may use — chosen per (user, day, provider,
+# section), not fixed, so two users sharing a genre tuple no longer share a
+# query. Popular never gets this: it's meant to be the same for everyone.
+_DISCOVER_PAGE_POOL = 3
+_DISCOVER_SORTS = ("vote_average.desc", "popularity.desc")
 
-def _discover(provider_id: int, params: dict, exclude_ids: set[int] | None = None) -> list[dict]:
+# Blend weights for re-ranking a section's (already provider/genre-filtered)
+# pool — genre-tuple overlap, overview-text similarity to the user's own
+# highly-rated movies, and raw popularity. Re-ranks what TMDB already
+# returned rather than replacing the discover call outright: at this app's
+# scale (~20 candidates per section) that keeps the watch-region/provider
+# correctness TMDB's own filter already gives for free. Named constants, not
+# inline literals, so they're a one-line tuning knob once there's real usage
+# data — no ground truth behind these starting values yet.
+_SCORE_WEIGHTS = {"genre": 0.4, "overview": 0.4, "popularity": 0.2}
+# No taste profile yet (cold start, or no cached overview text) — overview is
+# dropped entirely, not just zeroed, so a missing signal doesn't silently
+# subtract ranking weight; renormalized across the remaining two terms.
+_SCORE_WEIGHTS_NO_PROFILE = {"genre": 0.6, "popularity": 0.4}
+
+
+def _discover(
+    provider_id: int,
+    params: dict,
+    exclude_ids: set[int] | None = None,
+    rng: random.Random | None = None,
+) -> list[dict]:
+    call_params = dict(params)
+    if rng is not None and "page" not in call_params:
+        call_params["page"] = rng.randint(1, _DISCOVER_PAGE_POOL)
     try:
         data = tmdb.discover_movies({
             **_DISCOVER_BASE,
             "watch_region": REGION,
             "with_watch_providers": provider_id,
-            **params,
+            **call_params,
         })
     except Exception:
-        logger.exception("Streaming-world discover failed for provider %s params %s", provider_id, params)
+        logger.exception("Streaming-world discover failed for provider %s params %s", provider_id, call_params)
         return []
     results = [m for m in data.get("results", []) if m.get("id") and m.get("title") and m.get("poster_path")]
     if exclude_ids:
         results = [m for m in results if m["id"] not in exclude_ids]
+    if rng is not None:
+        # If the randomly-chosen page came back short (e.g. page 3 of a
+        # thin catalog), don't retry at page 1 — a short-but-real page is
+        # still a legitimate, differently-ordered result; the padding
+        # filler later tops up anything that ends up short overall.
+        rng.shuffle(results)
     return results
+
+
+def _genre_match_score(movie: dict, target_genres: list[int]) -> float:
+    if not target_genres:
+        return 0.0
+    overlap = len(set(movie.get("genre_ids") or []) & set(target_genres))
+    return overlap / len(target_genres)
+
+
+def _score_and_order(
+    results: list[dict],
+    target_genres: list[int],
+    profile_terms,
+    rng: random.Random,
+) -> list[dict]:
+    """Re-ranks (not re-fetches) a section's discover results by a blend of
+    genre match, overview-text similarity to the user's taste profile, and
+    popularity — then draws a full weighted-random order from that blend
+    (Efraimidis-Spirakis, see seeded_rng.weighted_sample) rather than a hard
+    sort, so even two users who land on the identical randomized page still
+    diverge in what shows first."""
+    if not results:
+        return results
+    weights = _SCORE_WEIGHTS if profile_terms else _SCORE_WEIGHTS_NO_PROFILE
+    scored: list[tuple[float, dict]] = []
+    for m in results:
+        score = (
+            weights["genre"] * _genre_match_score(m, target_genres)
+            + weights["popularity"] * ((m.get("vote_average") or 0) / 10)
+        )
+        if profile_terms:
+            score += weights["overview"] * overview_similarity(profile_terms, m.get("overview"))
+        scored.append((max(score, 1e-6), m))
+    return weighted_sample(scored, len(scored), rng)
 
 
 def _affinity_genres(signals) -> tuple[list[int], list[int]]:
@@ -84,16 +175,18 @@ def _affinity_genres(signals) -> tuple[list[int], list[int]]:
     return onboarding[:3], onboarding[3:6]
 
 
-def get_streaming_world(user_id: str, provider_id: int) -> dict:
+def get_streaming_world(user_id: str, provider_id: int, day: date | None = None) -> dict:
     """{"popular": [...], "for_you": [...], "different": [...]}, each a list
     of slim movie dicts (same shape as a /discover response's "results"),
     deduped against each other so the three rows don't just repeat the same
     handful of blockbusters. For You and Different also exclude anything the
     user has already reviewed — Popular doesn't, by design (see `already_seen`
     below)."""
+    day = day or date.today()
     supabase = get_supabase()
     signals = _load_user_signals(user_id, supabase)
     for_you_genres, different_genres = _affinity_genres(signals)
+    profile_terms = build_taste_profile_terms(signals)
 
     app = current_app._get_current_object()
 
@@ -107,15 +200,21 @@ def get_streaming_world(user_id: str, provider_id: int) -> dict:
     def _run(kind: str) -> tuple[str, list[dict]]:
         with app.app_context():
             if kind == "popular":
+                # No rng here on purpose — Popular is meant to read the same
+                # for everyone, a shared "what's trending on this service"
+                # fact, not a personalized one.
                 return kind, _discover(provider_id, {"sort_by": "popularity.desc"})
             genres = for_you_genres if kind == "for_you" else different_genres
             if not genres:
                 return kind, []
-            return kind, _discover(
+            rng = seeded_rng(user_id, day, f"streaming:{provider_id}:{kind}")
+            raw = _discover(
                 provider_id,
-                {"with_genres": "|".join(str(g) for g in genres), "sort_by": "vote_average.desc"},
+                {"with_genres": "|".join(str(g) for g in genres), "sort_by": rng.choice(_DISCOVER_SORTS)},
                 exclude_ids=already_seen,
+                rng=rng,
             )
+            return kind, _score_and_order(raw, genres, profile_terms, rng)
 
     pools: dict[str, list[dict]] = {"popular": [], "for_you": [], "different": []}
     executor = ThreadPoolExecutor(max_workers=3)
@@ -141,9 +240,13 @@ def get_streaming_world(user_id: str, provider_id: int) -> dict:
     # catalog overlap on the chosen genres can leave for_you/different empty
     # — fall back to a well-rated general pool rather than a dead section.
     if not pools["for_you"]:
-        pools["for_you"] = _discover(provider_id, {"sort_by": "vote_average.desc"}, exclude_ids=already_seen)
+        rng = seeded_rng(user_id, day, f"streaming:{provider_id}:for_you_fallback")
+        raw = _discover(provider_id, {"sort_by": "vote_average.desc"}, exclude_ids=already_seen, rng=rng)
+        pools["for_you"] = _score_and_order(raw, for_you_genres, profile_terms, rng)
     if not pools["different"]:
-        pools["different"] = _discover(provider_id, {"sort_by": "popularity.desc", "page": 2}, exclude_ids=already_seen)
+        rng = seeded_rng(user_id, day, f"streaming:{provider_id}:different_fallback")
+        raw = _discover(provider_id, {"sort_by": "popularity.desc"}, exclude_ids=already_seen, rng=rng)
+        pools["different"] = _score_and_order(raw, different_genres, profile_terms, rng)
 
     seen: set[int] = set()
     out: dict[str, list[dict]] = {}

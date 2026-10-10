@@ -138,8 +138,48 @@ def create_review():
             "category_ids": category_ids,
             "is_onboarding": bool(body.get("is_onboarding")),
         }
-        result = supabase.table("reviews").insert(review_payload).execute()
-        review = result.data[0]
+
+        # A non-onboarding review for this (user, movie) may already exist —
+        # e.g. a double-submit from a double-tap or a retried request. The
+        # data model only ever grows a repeat watch via rewatch_count, never
+        # a second review row, so treat a second POST as an edit of the
+        # existing row instead of inserting a duplicate. Without this guard,
+        # two rows for the same (user, movie) surface as two identical
+        # tiles in friends' "recently watched" feed (see
+        # friends_recent_activity's matching per-friend dedup).
+        existing_review = None
+        if not review_payload["is_onboarding"]:
+            existing_result = (
+                supabase.table("reviews")
+                .select("id")
+                .eq("user_id", str(user.id))
+                .eq("movie_id", movie_id)
+                .eq("is_onboarding", False)
+                .limit(1)
+                .execute()
+            )
+            if existing_result.data:
+                existing_review = existing_result.data[0]
+
+        if existing_review:
+            update_payload = {
+                "rating": review_payload["rating"],
+                "review_text": review_payload["review_text"],
+                "category_id": review_payload["category_id"],
+                "category_ids": review_payload["category_ids"],
+            }
+            result = (
+                supabase.table("reviews")
+                .update(update_payload)
+                .eq("id", existing_review["id"])
+                .execute()
+            )
+            review = result.data[0] if result.data else existing_review
+            status_code = 200
+        else:
+            result = supabase.table("reviews").insert(review_payload).execute()
+            review = result.data[0]
+            status_code = 201
 
         # Auto-remove from watchlist when a review is written
         supabase.table("watchlist").delete().eq("user_id", str(user.id)).eq("movie_id", movie_id).execute()
@@ -166,47 +206,52 @@ def create_review():
         except Exception:
             logger.exception("Failed to patch Movies of the Day after review")
 
-        # Only fan out to groups the caller actually owns and friends they actually
-        # have — otherwise any logged-in user could spam arbitrary users/probe
-        # group sizes by passing IDs they found or guessed.
-        allowed_group_ids = filter_owned_group_ids(supabase, str(user.id), group_ids)
-        allowed_friend_ids = filter_friend_ids(supabase, str(user.id), friend_ids)
+        # A resubmission of an already-reviewed movie shouldn't re-notify
+        # anyone — same "don't send the same thing twice" reasoning as the
+        # recipient-dedup just below, just at the review level instead of
+        # the recipient level.
+        if not existing_review:
+            # Only fan out to groups the caller actually owns and friends they actually
+            # have — otherwise any logged-in user could spam arbitrary users/probe
+            # group sizes by passing IDs they found or guessed.
+            allowed_group_ids = filter_owned_group_ids(supabase, str(user.id), group_ids)
+            allowed_friend_ids = filter_friend_ids(supabase, str(user.id), friend_ids)
 
-        # Expand group_ids to individual member user_ids and merge with the
-        # directly-selected friends into ONE recipient set — a friend who is
-        # both picked individually *and* a member of a selected group must
-        # only ever get one notification, not one per source (previously
-        # these were two separate inserts with no dedup between them, so
-        # that exact overlap sent the same recommendation twice).
-        recipient_ids: set[str] = set(allowed_friend_ids)
-        for gid in allowed_group_ids:
-            members = supabase.table("group_members").select("user_id").eq("group_id", gid).execute()
-            for m in members.data:
-                recipient_ids.add(m["user_id"])
-        recipient_ids.discard(str(user.id))
+            # Expand group_ids to individual member user_ids and merge with the
+            # directly-selected friends into ONE recipient set — a friend who is
+            # both picked individually *and* a member of a selected group must
+            # only ever get one notification, not one per source (previously
+            # these were two separate inserts with no dedup between them, so
+            # that exact overlap sent the same recommendation twice).
+            recipient_ids: set[str] = set(allowed_friend_ids)
+            for gid in allowed_group_ids:
+                members = supabase.table("group_members").select("user_id").eq("group_id", gid).execute()
+                for m in members.data:
+                    recipient_ids.add(m["user_id"])
+            recipient_ids.discard(str(user.id))
 
-        if recipient_ids and review.get("id"):
-            notif_rows = [
-                {
-                    "user_id": rid,
-                    "sender_id": str(user.id),
-                    "movie_id": movie_id,
-                    "message": "recommended a movie to you",
-                }
-                for rid in recipient_ids
-            ]
-            supabase.table("notifications").insert(notif_rows).execute()
+            if recipient_ids and review.get("id"):
+                notif_rows = [
+                    {
+                        "user_id": rid,
+                        "sender_id": str(user.id),
+                        "movie_id": movie_id,
+                        "message": "recommended a movie to you",
+                    }
+                    for rid in recipient_ids
+                ]
+                supabase.table("notifications").insert(notif_rows).execute()
 
-        # Record in group_recommendations for feed tracking (non-fatal if it fails)
-        if allowed_group_ids:
-            try:
-                if review.get("id"):
-                    rec_rows = [{"review_id": review["id"], "group_id": gid} for gid in allowed_group_ids]
-                    supabase.table("group_recommendations").upsert(rec_rows, on_conflict="review_id,group_id").execute()
-            except Exception:
-                pass
+            # Record in group_recommendations for feed tracking (non-fatal if it fails)
+            if allowed_group_ids:
+                try:
+                    if review.get("id"):
+                        rec_rows = [{"review_id": review["id"], "group_id": gid} for gid in allowed_group_ids]
+                        supabase.table("group_recommendations").upsert(rec_rows, on_conflict="review_id,group_id").execute()
+                except Exception:
+                    pass
 
-        return jsonify(review), 201
+        return jsonify(review), status_code
     except Exception as exc:
         return server_error("Failed to save review", exc, 500)
 

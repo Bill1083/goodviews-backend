@@ -221,6 +221,19 @@ def images(movie_id: int):
         return server_error("Failed to fetch movie images", exc, 502)
 
 
+@movies_bp.get("/<int:movie_id>/collection")
+@limiter.limit("60 per minute")
+def collection(movie_id: int):
+    """The movie's franchise, if any — other sequels/prequels/spin-offs to
+    show as a "<Franchise> Universe" row on the detail modal. See
+    app.services.movie_cache.get_movie_collection."""
+    try:
+        data = movie_cache.get_movie_collection(movie_id)
+        return jsonify(data)
+    except Exception as exc:
+        return server_error("Failed to fetch movie collection", exc, 502)
+
+
 @movies_bp.post("/<int:movie_id>/refresh")
 @require_auth
 @limiter.limit("5 per hour")
