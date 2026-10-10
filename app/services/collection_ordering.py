@@ -70,3 +70,58 @@ def order_collection_parts(parts: list[dict], *, seed_title: str) -> list[dict]:
         return (0 if is_direct else 1, p.get("release_date") or "9999-99-99")
 
     return sorted(parts, key=sort_key)
+
+
+# ─── Fallback for a franchise TMDB never collected ──────────────────────────
+# Not every real franchise has a TMDB "collection" object — e.g. the Tom
+# Holland Spider-Man trilogy (Homecoming / Far From Home / No Way Home) isn't
+# grouped into one. When a movie has no collection_id at all, movie_cache's
+# get_movie_collection falls back to TMDB's own /recommendations for that
+# film (already a reasonable "people who liked this also liked" signal, and
+# in practice does surface real sequels alongside unrelated noise), filtered
+# down to plausible franchise siblings by title.
+_LEADING_ARTICLE_RE = re.compile(r"^(the|a|an)\s+", re.IGNORECASE)
+
+
+def franchise_display_name(title: str) -> str:
+    """The human-readable franchise name for the fallback path's synthetic
+    "collection" — same trimming as _franchise_prefix (colon-subtitle,
+    leading article, trailing numbering stripped) but case-preserved, since
+    this is shown to the user (e.g. "Spider-Man", not "spider-man")."""
+    base = (title or "").split(":")[0].strip()
+    base = _LEADING_ARTICLE_RE.sub("", base)
+    return _TRAILING_NUMERAL_RE.sub("", base).strip()
+
+
+def _franchise_prefix(title: str) -> str:
+    """A looser cousin of _stem, used only for this fallback. Unlike _stem,
+    this strips ANY colon-subtitle (not just a numbering one) and a leading
+    article — "Spider-Man: Homecoming", "Spider-Man: Far From Home" and
+    "Spider-Man: No Way Home" all reduce to "spider-man". That looseness
+    would be wrong inside an *official* collection's own parts list (it's
+    exactly what over-matched shorts/spin-offs as "direct sequels" when
+    first tried in order_collection_parts/_stem above) — but here the
+    candidate pool is already TMDB's own curated recommendations for one
+    specific film, not "every movie with this word in the title", so a
+    false positive is rare and far cheaper than the alternative of finding
+    nothing at all."""
+    return franchise_display_name(title).lower()
+
+
+def filter_by_franchise_prefix(candidates: list[dict], *, seed_title: str) -> list[dict]:
+    """From a film's TMDB-recommended movies, keep only the ones that share
+    the seed's franchise prefix. Returns [] (not an error) when the seed
+    title itself reduces to nothing usable, or when nothing matches —
+    the overwhelmingly common case for a genuinely standalone film."""
+    seed_prefix = _franchise_prefix(seed_title)
+    if not seed_prefix:
+        return []
+    return [c for c in candidates if _franchise_prefix(c.get("title") or "") == seed_prefix]
+
+
+def order_by_release_date(parts: list[dict]) -> list[dict]:
+    """Chronological order, missing dates sorted last rather than first —
+    same convention as order_collection_parts. Used for the fallback path
+    above, where every surviving candidate already passed the franchise
+    filter, so there's no separate "direct vs. other" bucket to sort by."""
+    return sorted(parts, key=lambda p: p.get("release_date") or "9999-99-99")

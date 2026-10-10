@@ -6,8 +6,13 @@ from typing import Any
 
 from flask import current_app
 
-from app.services import tmdb
-from app.services.collection_ordering import order_collection_parts
+from app.services import cache, tmdb
+from app.services.collection_ordering import (
+    filter_by_franchise_prefix,
+    franchise_display_name,
+    order_by_release_date,
+    order_collection_parts,
+)
 from app.services.pg import chunked, paginate
 from app.services.supabase_client import get_supabase
 
@@ -475,15 +480,16 @@ def get_movie_collection(movie_id: int) -> dict:
         row = _lookup()
 
     collection_id = row.get("collection_id") if row else None
+    seed_title = (row.get("title") if row else None) or ""
     if not collection_id:
-        return {"collection": None}
+        return _fallback_franchise_collection(movie_id, seed_title)
 
     data = tmdb.get_collection_details(collection_id)
     parts = [
         p for p in (data.get("parts") or [])
         if p.get("id") and p.get("id") != movie_id and p.get("title")
     ]
-    ordered = order_collection_parts(parts, seed_title=row.get("title") or "")
+    ordered = order_collection_parts(parts, seed_title=seed_title)
     return {
         "collection": {
             "id": data.get("id"),
@@ -493,3 +499,51 @@ def get_movie_collection(movie_id: int) -> dict:
             "parts": [_slim_collection_part(p) for p in ordered],
         }
     }
+
+
+# Not every real franchise has a TMDB collection object (e.g. the Tom Holland
+# Spider-Man trilogy isn't grouped into one) — see
+# collection_ordering.filter_by_franchise_prefix for the fallback itself.
+# Its result is cached per movie: unlike recommendations.py's own use of
+# tmdb.get_movie_recommendations (seed-specific, genuinely low repeat-hit-
+# rate there), this is keyed only on the movie_id, so many different users
+# opening the same popular standalone film's modal all share one cached
+# answer instead of each paying for their own TMDB call.
+_FRANCHISE_FALLBACK_TTL_DAYS = 14
+
+
+def _fallback_franchise_collection(movie_id: int, seed_title: str) -> dict:
+    if not seed_title:
+        return {"collection": None}
+    cache_key = f"franchise_fallback:{movie_id}"
+    cached = cache.cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    try:
+        data = tmdb.get_movie_recommendations(movie_id)
+    except Exception:
+        logger.exception("Franchise fallback: recommendations fetch failed for movie %s", movie_id)
+        return {"collection": None}
+
+    candidates = [
+        p for p in (data.get("results") or [])
+        if p.get("id") and p.get("id") != movie_id and p.get("title")
+    ]
+    siblings = filter_by_franchise_prefix(candidates, seed_title=seed_title)
+    if siblings:
+        ordered = order_by_release_date(siblings)
+        result = {
+            "collection": {
+                "id": None,
+                "name": franchise_display_name(seed_title),
+                "poster_path": None,
+                "backdrop_path": None,
+                "parts": [_slim_collection_part(p) for p in ordered],
+            }
+        }
+    else:
+        result = {"collection": None}
+
+    cache.cache_set(cache_key, result, ttl=_FRANCHISE_FALLBACK_TTL_DAYS * 86400)
+    return result

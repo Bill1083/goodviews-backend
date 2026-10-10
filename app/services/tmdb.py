@@ -1,7 +1,10 @@
+import difflib
 import logging
+import math
 import threading
 import time
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 
 import requests
 from flask import current_app
@@ -123,13 +126,125 @@ def _sort_by_popularity(data: dict, key: str = "popularity") -> dict:
     return data
 
 
+# TMDB's own "popularity" is a volatile, recency-weighted metric (recent
+# view/search velocity) — a small or niche title can spike it well above a
+# genuine mainstream film with tens of thousands of accumulated votes (e.g.
+# a "Kung Fu Soccer" outranking "Kung Fu Panda"). vote_count is a much more
+# stable proxy for "how many people actually know this film" — blended in,
+# log-scaled so a handful of early votes on a brand-new release don't get
+# an outsized bonus, and weighted empirically against real search results
+# so an established multi-thousand-vote title comfortably outranks a
+# low-vote popularity spike while a genuinely-trending new release (high
+# popularity, votes still accumulating) can still surface near the top.
+_MAINSTREAM_VOTE_WEIGHT = 30
+
+
+def _mainstream_score(item: dict) -> float:
+    popularity = item.get("popularity") or 0
+    vote_count = item.get("vote_count") or 0
+    return popularity + _MAINSTREAM_VOTE_WEIGHT * math.log10(vote_count + 1)
+
+
+def _sort_by_mainstream_score(data: dict) -> dict:
+    if "results" in data:
+        data["results"] = sorted(data["results"], key=_mainstream_score, reverse=True)
+    return data
+
+
+# ─── Fuzzy "did you mean" fallback for a zero-result movie search ───────────
+# TMDB's own search is a fairly literal text match — a badly garbled query
+# (missing/extra/wrong letters, dropped words) often comes back with nothing
+# at all. Rather than a dedicated spelling-correction service (a new
+# dependency, or an external API call), this does plain stdlib difflib
+# matching against a small, cached corpus of well-known titles: at a few
+# hundred candidates this is fast, and it only ever runs on the already-rare
+# zero-results path, never on every search.
+_FUZZY_CORPUS_PAGES = 8  # per source — up to a few hundred unique titles after dedup
+_FUZZY_CORPUS_TTL_DAYS = 7
+_FUZZY_MATCH_CUTOFF = 0.55
+_FUZZY_MATCH_LIMIT = 10
+_FUZZY_CORPUS_CACHE_KEY = "tmdb:fuzzy_corpus:v1"
+
+
+def _fetch_corpus_page(source: str, page: int) -> list[dict]:
+    try:
+        if source == "top_rated":
+            data = _tmdb_get("/movie/top_rated", {"page": page})
+        else:
+            data = _tmdb_get(
+                "/discover/movie", {"sort_by": "vote_count.desc", "page": page, "include_adult": "false"}
+            )
+        return data.get("results") or []
+    except Exception:
+        logger.exception("Fuzzy-search corpus page fetch failed (%s page %s)", source, page)
+        return []
+
+
+def _build_popular_titles_corpus() -> list[dict]:
+    app = current_app._get_current_object()
+    tasks = [(source, p) for source in ("top_rated", "vote_count") for p in range(1, _FUZZY_CORPUS_PAGES + 1)]
+
+    def _run(task: tuple[str, int]) -> list[dict]:
+        source, page = task
+        with app.app_context():
+            return _fetch_corpus_page(source, page)
+
+    seen: dict[int, dict] = {}
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        for results in executor.map(_run, tasks):
+            for m in results:
+                mid = m.get("id")
+                if mid and mid not in seen and m.get("title"):
+                    seen[mid] = m
+    return list(seen.values())
+
+
+def get_popular_titles_corpus() -> list[dict]:
+    """A bounded corpus of well-known movies — TMDB's own top-rated list
+    plus its most-voted-on titles, merged and deduped — used only as the
+    fuzzy-match fallback below. Cached a week: this barely changes day to
+    day, and rebuilding it is dozens of TMDB calls."""
+    cached = _cache_get(_FUZZY_CORPUS_CACHE_KEY)
+    if cached:
+        return cached
+    corpus = _build_popular_titles_corpus()
+    if corpus:
+        _cache_set(_FUZZY_CORPUS_CACHE_KEY, corpus, ttl=_FUZZY_CORPUS_TTL_DAYS * 86400)
+    return corpus
+
+
+def fuzzy_search_movies(query: str) -> list[dict]:
+    """Best-effort "did you mean" matches for a query that found nothing via
+    TMDB's own search — e.g. "Back Tk the Fu" for "Back to the Future"."""
+    corpus = get_popular_titles_corpus()
+    if not corpus:
+        return []
+    normalized_query = " ".join(query.lower().split())
+    titles_by_key = {" ".join(m["title"].lower().split()): m for m in corpus}
+    matches = difflib.get_close_matches(
+        normalized_query, titles_by_key.keys(), n=_FUZZY_MATCH_LIMIT, cutoff=_FUZZY_MATCH_CUTOFF
+    )
+    return [titles_by_key[t] for t in matches]
+
+
 def search_movies(query: str, page: int = 1) -> dict:
     data = _cached_search(
         _search_key("search", query, page),
         current_app.config["SEARCH_CACHE_TTL_SECONDS"],
         lambda: _tmdb_get("/search/movie", {"query": query, "page": page}),
     )
-    return _sort_by_popularity(data)
+    data = _sort_by_mainstream_score(data)
+    if page == 1 and not data.get("results"):
+        fuzzy_matches = fuzzy_search_movies(query)
+        if fuzzy_matches:
+            return {
+                "page": 1,
+                "results": fuzzy_matches,
+                "total_pages": 1,
+                "total_results": len(fuzzy_matches),
+                "fuzzy_fallback": True,
+            }
+    return data
 
 
 SEGMENT_TOKENS = {"core": "credits", "media": "videos", "providers": "watch/providers"}
