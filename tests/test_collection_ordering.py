@@ -125,3 +125,24 @@ def test_franchise_display_name_strips_subtitle_article_and_numbering():
     assert franchise_display_name("Spider-Man: Homecoming") == "Spider-Man"
     assert franchise_display_name("The Fast and the Furious 2") == "Fast and the Furious"
     assert franchise_display_name("Toy Story") == "Toy Story"
+
+
+def test_franchise_prefix_filter_catches_a_sequel_named_with_a_plain_appended_word():
+    """The actual reported case: "The Dark Knight" -> "The Dark Knight
+    Rises" adds a plain word with no number and no colon at all — neither
+    _franchise_prefix's numbering-stripping nor its colon-stripping has
+    anything to grab onto, so this needs the whole-word prefix check."""
+    candidates = [
+        part(49026, "The Dark Knight Rises", "2012-07-17"),
+        part(999, "Dark Knightmare", "2015-01-01"),  # must NOT match — not a word-boundary prefix
+        part(998, "Knight", "2015-01-01"),  # too short/generic to trust alone
+    ]
+    siblings = filter_by_franchise_prefix(candidates, seed_title="The Dark Knight")
+    assert [p["id"] for p in siblings] == [49026]
+
+
+def test_franchise_prefix_filter_whole_word_prefix_works_either_direction():
+    """Works whichever of the two is the seed — "Dark Knight" is the
+    shorter title here, "Dark Knight Rises" the longer one."""
+    candidates = [part(1, "The Dark Knight")]
+    assert [p["id"] for p in filter_by_franchise_prefix(candidates, seed_title="The Dark Knight Rises")] == [1]

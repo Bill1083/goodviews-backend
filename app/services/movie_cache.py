@@ -464,7 +464,7 @@ def get_movie_collection(movie_id: int) -> dict:
     def _lookup() -> dict | None:
         result = (
             supabase.table("movies")
-            .select("collection_id, collection_name, title")
+            .select("collection_id, collection_name, title, core_updated_at")
             .eq("id", movie_id)
             .limit(1)
             .execute()
@@ -472,10 +472,18 @@ def get_movie_collection(movie_id: int) -> dict:
         return result.data[0] if result.data else None
 
     row = _lookup()
-    if row is None:
-        # Never fetched at all (e.g. a cold id hit directly) — one full
-        # core-segment fetch the normal way; not the expected path, since
-        # the modal always fetches GET /<id> first.
+    if row is None or not row.get("core_updated_at"):
+        # Either never fetched at all, or only ever written as a bare
+        # candidate-pool stub (recommendations._upsert_movie_stub and
+        # friends — see their own docstrings — never set collection_id,
+        # and don't stamp core_updated_at either, which is exactly how we
+        # tell the two apart). A hugely popular movie like "The Dark
+        # Knight" is very likely to have been stub-inserted by someone
+        # else's For You/streaming-world candidate list long before anyone
+        # opens its own detail modal — a NULL collection_id on a row like
+        # that isn't evidence the movie has no franchise, just that
+        # nothing has actually looked yet. One full core-segment fetch
+        # settles it properly either way.
         get_movie(movie_id, segments=("core",))
         row = _lookup()
 

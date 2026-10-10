@@ -108,6 +108,43 @@ def _franchise_prefix(title: str) -> str:
     return franchise_display_name(title).lower()
 
 
+def _normalized_title(title: str) -> str:
+    """Lowercased, leading-article-stripped only — unlike _franchise_prefix,
+    deliberately does NOT strip a trailing word/colon-subtitle, since
+    _is_franchise_sibling below needs the full title to test one against
+    the other as a prefix."""
+    return _LEADING_ARTICLE_RE.sub("", (title or "").strip()).lower()
+
+
+def _is_title_prefix_of(shorter: str, longer: str) -> bool:
+    """True if `shorter` is `longer` up to a word boundary — "dark knight"
+    is a prefix of "dark knight rises", but not of "dark knightmare"."""
+    if not longer.startswith(shorter):
+        return False
+    rest = longer[len(shorter):]
+    return rest == "" or rest.startswith(" ")
+
+
+_MIN_PREFIX_LEN = 4  # a word this short alone is too generic to trust as a franchise signal
+
+
+def _is_franchise_sibling(title: str, seed_title: str, seed_prefix: str) -> bool:
+    if _franchise_prefix(title) == seed_prefix:
+        return True
+    # Catches a sequel named by just appending a plain word, with no
+    # number and no colon at all — "The Dark Knight" -> "The Dark Knight
+    # Rises" — which _franchise_prefix's own numbering/colon stripping has
+    # nothing to grab onto. Checked as a whole-word prefix either
+    # direction, so "Dark Knight"/"Dark Knight Rises" matches but "Dark
+    # Knight"/"Dark Knightmare" doesn't. Same reasoning as _franchise_prefix's
+    # own docstring for why looseness is fine here: this is still only
+    # run against one film's own TMDB-recommended pool, not a catalog scan.
+    norm_title, norm_seed = _normalized_title(title), _normalized_title(seed_title)
+    if len(norm_seed) < _MIN_PREFIX_LEN or len(norm_title) < _MIN_PREFIX_LEN:
+        return False
+    return _is_title_prefix_of(norm_seed, norm_title) or _is_title_prefix_of(norm_title, norm_seed)
+
+
 def filter_by_franchise_prefix(candidates: list[dict], *, seed_title: str) -> list[dict]:
     """From a film's TMDB-recommended movies, keep only the ones that share
     the seed's franchise prefix. Returns [] (not an error) when the seed
@@ -116,7 +153,7 @@ def filter_by_franchise_prefix(candidates: list[dict], *, seed_title: str) -> li
     seed_prefix = _franchise_prefix(seed_title)
     if not seed_prefix:
         return []
-    return [c for c in candidates if _franchise_prefix(c.get("title") or "") == seed_prefix]
+    return [c for c in candidates if _is_franchise_sibling(c.get("title") or "", seed_title, seed_prefix)]
 
 
 def order_by_release_date(parts: list[dict]) -> list[dict]:
