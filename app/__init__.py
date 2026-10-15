@@ -55,6 +55,7 @@ def create_app() -> Flask:
     from app.controllers.onboarding import onboarding_bp
     from app.controllers.stats import stats_bp
     from app.controllers.sitemap import sitemap_bp
+    from app.controllers.moderation import moderation_bp, admin_bp
 
     app.register_blueprint(movies_bp, url_prefix="/api/movies")
     app.register_blueprint(reviews_bp, url_prefix="/api/reviews")
@@ -70,6 +71,8 @@ def create_app() -> Flask:
     app.register_blueprint(onboarding_bp, url_prefix="/api/onboarding")
     app.register_blueprint(stats_bp, url_prefix="/api/stats")
     app.register_blueprint(sitemap_bp, url_prefix="/api/sitemap")
+    app.register_blueprint(moderation_bp, url_prefix="/api/moderation")
+    app.register_blueprint(admin_bp, url_prefix="/api/admin")
 
     @app.after_request
     def security_headers(response):

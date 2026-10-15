@@ -4,6 +4,7 @@ from functools import wraps
 
 from flask import request, jsonify
 
+from app.services import moderation
 from app.services.supabase_client import get_supabase
 from app.services.trusted_devices import verify_trusted_device
 
@@ -40,12 +41,7 @@ def _validate_token(token: str):
     return user_response.user if user_response else None
 
 
-def require_auth(f):
-    """Validates the bearer JWT and, for any account with a verified MFA
-    factor enrolled, also requires AAL2 (or a valid trusted-device token) —
-    without this, a stolen/guessed password alone would be enough to reach
-    every endpoint here, 2FA notwithstanding."""
-
+def _authenticated(f, *, allow_blocked: bool):
     @wraps(f)
     def decorated(*args, **kwargs):
         auth_header = request.headers.get("Authorization", "")
@@ -61,10 +57,49 @@ def require_auth(f):
             if not _is_trusted_device(str(user.id)):
                 return jsonify({"error": "MFA verification required"}), 401
 
+        # Moderation: a blocked account gets nothing but the endpoint that
+        # tells it so. Fails open (state None) if moderation can't be read.
+        try:
+            state = moderation.get_state(get_supabase(), str(user.id))
+        except Exception:
+            state = None
+        if state and state.get("moderation_status") == "blocked" and not allow_blocked:
+            return jsonify({"error": "Your account is blocked.", "code": "account_blocked"}), 403
+
         request.current_user = user
+        request.moderation_state = state
         return f(*args, **kwargs)
 
     return decorated
+
+
+def require_auth(f):
+    """Validates the bearer JWT and, for any account with a verified MFA
+    factor enrolled, also requires AAL2 (or a valid trusted-device token) —
+    without this, a stolen/guessed password alone would be enough to reach
+    every endpoint here, 2FA notwithstanding. Blocked accounts (see
+    services/moderation.py) are turned away with 403 account_blocked."""
+    return _authenticated(f, allow_blocked=False)
+
+
+def require_auth_allow_blocked(f):
+    """require_auth, but a blocked account still gets through — only for the
+    endpoint that tells a blocked user why they're blocked."""
+    return _authenticated(f, allow_blocked=True)
+
+
+def require_admin(f):
+    """require_auth plus profiles.is_admin. Anyone else gets a 404 rather
+    than a 403, so the admin API's existence isn't advertised."""
+
+    @wraps(f)
+    def gate(*args, **kwargs):
+        state = getattr(request, "moderation_state", None)
+        if not state or not state.get("is_admin"):
+            return jsonify({"error": "Not found"}), 404
+        return f(*args, **kwargs)
+
+    return _authenticated(gate, allow_blocked=False)
 
 
 def require_auth_basic(f):

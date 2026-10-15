@@ -9,7 +9,7 @@ from app.utils.auth import require_auth
 from app.utils.sanitize import sanitize_text
 from app.utils.social import filter_friend_ids, filter_owned_group_ids
 from app.services.supabase_client import get_supabase
-from app.services import cache, daily_picks, movie_cache
+from app.services import cache, daily_picks, moderation, movie_cache
 from app.utils.errors import server_error
 
 logger = logging.getLogger(__name__)
@@ -83,6 +83,17 @@ def create_review():
 
     if rating is None or not (1 <= float(rating) <= 5):
         return jsonify({"error": "Rating must be between 1 and 5"}), 400
+
+    blocked = moderation.posting_block(request.moderation_state)
+    if blocked:
+        return jsonify(blocked[0]), blocked[1]
+
+    # Hate / strong swearing: the comment is dropped (the rating is still
+    # saved) and the strike is applied once the review exists - see below.
+    violation = moderation.detect(review_text)
+    flagged_text = review_text
+    if violation:
+        review_text = ""
 
     # Lightweight fallback stub, used only if the authoritative TMDB-backed
     # fetch below fails (e.g. TMDB unreachable) — keeps review creation from
@@ -206,6 +217,10 @@ def create_review():
             except Exception:
                 pass
 
+        if violation:
+            review = {**review, "moderation": moderation.record_violation(
+                supabase, str(user.id), category=violation[0], text=flagged_text, review_id=review.get("id"),
+            )}
         return jsonify(review), 201
     except Exception as exc:
         return server_error("Failed to save review", exc, 500)
@@ -219,6 +234,10 @@ def update_review(review_id: str):
     body = request.get_json(silent=True)
     if not body:
         return jsonify({"error": "JSON body required"}), 400
+
+    blocked = moderation.posting_block(request.moderation_state)
+    if blocked:
+        return jsonify(blocked[0]), blocked[1]
 
     supabase = get_supabase()
 
@@ -242,8 +261,16 @@ def update_review(review_id: str):
             return jsonify({"error": "Rating must be between 1 and 5"}), 400
         update_data["rating"] = float(rating)
 
+    violation = None
+    flagged_text = ""
     if "review_text" in body:
-        update_data["review_text"] = sanitize_text(body.get("review_text", ""))
+        new_text = sanitize_text(body.get("review_text", ""))
+        violation = moderation.detect(new_text)
+        if violation:
+            # The offending edit is discarded; the existing comment stays.
+            flagged_text = new_text
+        else:
+            update_data["review_text"] = new_text
 
     if "category_id" in body:
         update_data["category_id"] = body.get("category_id") or None
@@ -307,6 +334,10 @@ def update_review(review_id: str):
             except Exception:
                 pass
 
+        if violation:
+            review = {**review, "moderation": moderation.record_violation(
+                supabase, str(user.id), category=violation[0], text=flagged_text, review_id=review_id,
+            )}
         return jsonify(review), 200
     except Exception as exc:
         return server_error("Failed to update review", exc, 500)
