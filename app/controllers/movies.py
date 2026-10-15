@@ -6,9 +6,10 @@ from app import limiter
 from app.utils.auth import require_auth
 from app.utils.sanitize import sanitize_text
 from app.utils.social import filter_friend_ids, filter_owned_group_ids
-from app.services import tmdb
+from app.services import community, tmdb
 from app.services import movie_cache
 from app.services import daily_picks, recommendations, streaming_picks, streaming_worlds
+from app.services.cache import cache_get, cache_set
 from app.services.supabase_client import get_supabase
 from app.utils.errors import server_error
 from app.utils.tz import parse_tz
@@ -209,6 +210,26 @@ def details(movie_id: int):
         return jsonify(data)
     except Exception as exc:
         return server_error("Failed to fetch movie details", exc, 502)
+
+
+COMMUNITY_CACHE_TTL_SECONDS = 15 * 60
+
+
+@movies_bp.get("/<int:movie_id>/community")
+@limiter.limit("60 per minute")
+def community_stats(movie_id: int):
+    """Public: how members as a whole rated a film — totals only, for the
+    film's public page (see app.services.community)."""
+    key = f"community:{movie_id}"
+    cached = cache_get(key)
+    if cached is not None:
+        return jsonify(cached)
+    try:
+        data = community.community_stats(get_supabase(), movie_id)
+    except Exception as exc:
+        return server_error("Failed to fetch community ratings", exc, 500)
+    cache_set(key, data, COMMUNITY_CACHE_TTL_SECONDS)
+    return jsonify(data)
 
 
 @movies_bp.get("/<int:movie_id>/images")

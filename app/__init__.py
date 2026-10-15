@@ -1,5 +1,5 @@
 import click
-from flask import Flask
+from flask import Flask, request
 from flask_cors import CORS
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
@@ -54,6 +54,7 @@ def create_app() -> Flask:
     from app.controllers.auth import auth_bp
     from app.controllers.onboarding import onboarding_bp
     from app.controllers.stats import stats_bp
+    from app.controllers.sitemap import sitemap_bp
 
     app.register_blueprint(movies_bp, url_prefix="/api/movies")
     app.register_blueprint(reviews_bp, url_prefix="/api/reviews")
@@ -68,6 +69,21 @@ def create_app() -> Flask:
     app.register_blueprint(auth_bp, url_prefix="/api/auth")
     app.register_blueprint(onboarding_bp, url_prefix="/api/onboarding")
     app.register_blueprint(stats_bp, url_prefix="/api/stats")
+    app.register_blueprint(sitemap_bp, url_prefix="/api/sitemap")
+
+    @app.after_request
+    def security_headers(response):
+        # Baseline hardening for every API response. Link scanners and
+        # site-reputation checks look for these; the website's own headers
+        # are set by nginx (deploy/nginx-site.conf in the client repo).
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        # HSTS only means anything over HTTPS (ProxyFix makes is_secure
+        # reflect nginx's X-Forwarded-Proto).
+        if request.is_secure:
+            response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+        return response
 
     @app.get("/api/health")
     def health():

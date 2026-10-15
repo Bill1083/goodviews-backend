@@ -64,3 +64,21 @@ boundaries are bucketed in the user's local time.
 
 Payloads are cached in Redis under a per-user version that every write of the user's own data bumps
 (`app/services/cache.py`). `WRAPPED_PREVIEW_UNLOCK=1` bypasses the date for local development only.
+
+## Public film pages + sitemap
+
+The website has a public page per film (`/film/603-the-matrix`). Two public endpoints back it:
+
+- `GET /api/movies/<id>/community` — how members rated the film: totals only (count, average, and
+  the 1–5 star spread), never who rated it. The average and spread appear only once at least
+  3 members have rated the film (`COMMUNITY_MIN_RATINGS` in `app/services/community.py`).
+- `GET /api/sitemap/films.xml` — every film with at least that many ratings, as page URLs built from
+  `PUBLIC_SITE_URL` (env, default `https://goodviews.online`; change it with the domain). The
+  website's `robots.txt` points search engines here.
+
+Page URL slugs come from `app/utils/slug.py`, which mirrors the client's `src/utils/filmUrl.ts`;
+the two must stay in step or the sitemap and the pages' canonical URLs disagree.
+
+Every API response also carries `nosniff`, `Referrer-Policy`, `X-Frame-Options` and (over HTTPS)
+HSTS headers. The API has no `robots.txt` on purpose: search engines must be able to fetch
+`/api/movies/...` to render film pages.

@@ -9,6 +9,10 @@ class Config:
     SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
     REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 
+    # The public website's address (no trailing slash). Film-page URLs in the
+    # sitemap are built from it, so it changes with the site's domain.
+    PUBLIC_SITE_URL = os.getenv("PUBLIC_SITE_URL", "https://goodviews.online").rstrip("/")
+
     # TMDB search cache — transient only, never persisted to the DB (1-4h range)
     SEARCH_CACHE_TTL_SECONDS = int(os.getenv("SEARCH_CACHE_TTL_SECONDS", 60 * 60 * 2))
 
